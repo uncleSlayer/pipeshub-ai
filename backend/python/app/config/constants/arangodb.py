@@ -66,6 +66,7 @@ class Connectors(Enum):
 
     SNOWFLAKE = "SNOWFLAKE"
     POSTGRESQL = "POSTGRESQL"
+    CLICKHOUSE = "CLICKHOUSE"
 
     UNKNOWN = "UNKNOWN"
 
@@ -93,7 +94,8 @@ class AppGroups(Enum):
     RSS = "RSS"
 
     SNOWFLAKE = "Snowflake"
-    POSTGRESQL = "PostgreSQL"  
+    POSTGRESQL = "PostgreSQL"
+    CLICKHOUSE = "ClickHouse"
 
 class OriginTypes(Enum):
     CONNECTOR = "CONNECTOR"
