@@ -1,12 +1,13 @@
 """
 ClickHouse Connector
 
-Syncs databases and tables from ClickHouse.
+Syncs databases, tables, and views from ClickHouse.
 """
 import asyncio
 import hashlib
 import json
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from logging import Logger
@@ -58,6 +59,7 @@ from app.models.entities import (
     RecordGroupType,
     RecordType,
     SQLTableRecord,
+    SQLViewRecord,
     User,
 )
 from app.models.permission import EntityType, Permission, PermissionType
@@ -72,24 +74,29 @@ CLICKHOUSE_TABLE_ROW_LIMIT = int(os.getenv("CLICKHOUSE_TABLE_ROW_LIMIT", "1000")
 
 SYSTEM_DATABASES = ('system', 'INFORMATION_SCHEMA', 'information_schema')
 
+VIEW_ENGINES = ('View', 'MaterializedView')
+
 
 @dataclass
 class SyncStats:
     databases_synced: int = 0
     tables_new: int = 0
+    views_new: int = 0
     errors: int = 0
 
     def to_dict(self) -> Dict[str, int]:
         return {
             'databases_synced': self.databases_synced,
             'tables_new': self.tables_new,
+            'views_new': self.views_new,
             'errors': self.errors,
         }
 
     def log_summary(self, logger) -> None:
         logger.info(
             f"Sync Stats: "
-            f"Databases={self.databases_synced}, Tables(new={self.tables_new}) | "
+            f"Databases={self.databases_synced}, Tables(new={self.tables_new}), "
+            f"Views(new={self.views_new}) | "
             f"Errors={self.errors}"
         )
 
@@ -119,7 +126,7 @@ class ClickHouseTable:
 
 @ConnectorBuilder("ClickHouse")\
     .in_group("ClickHouse")\
-    .with_description("Sync databases and tables from ClickHouse")\
+    .with_description("Sync databases, tables, and views from ClickHouse")\
     .with_categories(["Database"])\
     .with_scopes([ConnectorScope.PERSONAL.value])\
     .with_auth([
@@ -266,6 +273,16 @@ class ClickHouseTable:
             default_operator=MultiselectOperator.IN.value
         ))
         .add_filter_field(FilterField(
+            name="views",
+            display_name="Views",
+            filter_type=FilterType.MULTISELECT,
+            category=FilterCategory.SYNC,
+            description="Select specific views to sync",
+            option_source_type=OptionSourceType.DYNAMIC,
+            default_value=[],
+            default_operator=MultiselectOperator.IN.value
+        ))
+        .add_filter_field(FilterField(
             name=IndexingFilterKey.TABLES.value,
             display_name="Index Tables",
             filter_type=FilterType.BOOLEAN,
@@ -379,14 +396,17 @@ class ClickHouseConnector(BaseConnector):
 
     # ── Filter helpers ──────────────────────────────────────────────────
 
-    def _get_filter_values(self) -> Tuple[Optional[List[str]], Optional[List[str]]]:
+    def _get_filter_values(self) -> Tuple[Optional[List[str]], Optional[List[str]], Optional[List[str]]]:
         db_filter = self.sync_filters.get("databases")
         selected_databases = db_filter.value if db_filter and db_filter.value else None
 
         table_filter = self.sync_filters.get("tables")
         selected_tables = table_filter.value if table_filter and table_filter.value else None
 
-        return selected_databases, selected_tables
+        view_filter = self.sync_filters.get("views")
+        selected_views = view_filter.value if view_filter and view_filter.value else None
+
+        return selected_databases, selected_tables, selected_views
 
     async def _get_permissions(self) -> List[Permission]:
         return [Permission(
@@ -396,43 +416,39 @@ class ClickHouseConnector(BaseConnector):
 
     # ── Data fetching ───────────────────────────────────────────────────
 
+    _IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9_]+$")
+
+    def _validate_identifier(self, name: str) -> str:
+        """Validate a database/table identifier to prevent SQL injection."""
+        if not self._IDENTIFIER_RE.match(name):
+            raise ValueError(f"Invalid identifier: {name!r}")
+        return name
+
     def _fetch_databases(self) -> List[ClickHouseDatabase]:
         """Fetch non-system databases from ClickHouse."""
-        response = self.data_source.query(
-            query="SELECT name FROM system.databases "
-                  "WHERE name NOT IN ('system','INFORMATION_SCHEMA','information_schema') "
-                  "ORDER BY name"
-        )
+        response = self.data_source.list_databases()
         if not response.success:
             self.logger.error(f"Failed to fetch databases: {response.error}")
             return []
 
         return [
-            ClickHouseDatabase(name=row[0])
-            for row in response.data.get("result_rows", [])
+            ClickHouseDatabase(name=db["name"])
+            for db in (response.data or [])
         ]
 
     def _fetch_tables(self, database_name: str) -> List[ClickHouseTable]:
         """Fetch tables for a database including column metadata."""
-        response = self.data_source.query(
-            query="SELECT name, engine, total_rows, total_bytes, "
-                  "metadata_modification_time, comment "
-                  "FROM system.tables "
-                  f"WHERE database = '{database_name}' AND is_temporary = 0 "
-                  "ORDER BY name"
-        )
+        response = self.data_source.list_tables(database=database_name)
         if not response.success:
             self.logger.error(f"Failed to fetch tables for {database_name}: {response.error}")
             return []
 
         tables = []
-        column_names = response.data.get("column_names", [])
-        for row in response.data.get("result_rows", []):
-            row_dict = dict(zip(column_names, row))
+        for row_dict in (response.data or []):
             columns = self._fetch_columns(database_name, row_dict["name"])
 
-            primary_keys = [c["name"] for c in columns if c.get("is_in_primary_key")]
-            order_by = [c["name"] for c in columns if c.get("is_in_sorting_key")]
+            primary_keys = [column["name"] for column in columns if column.get("is_in_primary_key")]
+            order_by = [column["name"] for column in columns if column.get("is_in_sorting_key")]
 
             tables.append(ClickHouseTable(
                 name=row_dict["name"],
@@ -448,32 +464,45 @@ class ClickHouseConnector(BaseConnector):
             ))
         return tables
 
+    def _fetch_views(self, database_name: str) -> List[ClickHouseTable]:
+        """Fetch views (View and MaterializedView) for a database including column metadata."""
+        response = self.data_source.list_views(database=database_name)
+        if not response.success:
+            self.logger.error(f"Failed to fetch views for {database_name}: {response.error}")
+            return []
+
+        views = []
+        for row_dict in (response.data or []):
+            columns = self._fetch_columns(database_name, row_dict["name"])
+
+            views.append(ClickHouseTable(
+                name=row_dict["name"],
+                database_name=database_name,
+                engine=row_dict.get("engine", ""),
+                columns=columns,
+                comment=row_dict.get("comment", "") or "",
+                metadata_modification_time=str(row_dict.get("metadata_modification_time", "")),
+            ))
+        return views
+
     def _fetch_columns(self, database: str, table: str) -> List[Dict[str, Any]]:
         """Fetch column definitions for a table from system.columns."""
-        response = self.data_source.query(
-            query="SELECT name, type, default_kind, default_expression, "
-                  "comment, is_in_primary_key, is_in_sorting_key "
-                  "FROM system.columns "
-                  f"WHERE database = '{database}' AND table = '{table}' "
-                  "ORDER BY position"
-        )
+        response = self.data_source.get_table_schema(database=database, table=table)
         if not response.success:
             self.logger.warning(f"Failed to fetch columns for {database}.{table}: {response.error}")
             return []
 
-        column_names = response.data.get("column_names", [])
-        return [
-            dict(zip(column_names, row))
-            for row in response.data.get("result_rows", [])
-        ]
+        return response.data or []
 
     def _fetch_table_rows(
         self, database: str, table: str, limit: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """Fetch sample rows from a table."""
         row_limit = limit if limit is not None else CLICKHOUSE_TABLE_ROW_LIMIT
+        safe_db = self._validate_identifier(database)
+        safe_tbl = self._validate_identifier(table)
         response = self.data_source.query(
-            query=f"SELECT * FROM `{database}`.`{table}` LIMIT {row_limit}"
+            query=f"SELECT * FROM `{safe_db}`.`{safe_tbl}` LIMIT {int(row_limit)}"
         )
         if not response.success:
             self.logger.warning(f"Failed to fetch rows for {database}.{table}: {response.error}")
@@ -637,6 +666,146 @@ class ClickHouseConnector(BaseConnector):
 
         self.logger.info(f"Completed syncing {len(tables)} updated tables in {database_name}")
 
+    # ── View sync methods ──────────────────────────────────────────────
+
+    def _fetch_view_definition(self, database: str, view: str) -> str:
+        """Fetch view definition via SHOW CREATE TABLE (works for views in ClickHouse)."""
+        response = self.data_source.get_table_ddl(database=database, table=view)
+        if response.success:
+            return str(response.data.get("ddl", ""))
+        return ""
+
+    async def _process_views_generator(
+        self,
+        database_name: str,
+        views: List[ClickHouseTable],
+    ) -> AsyncGenerator[Tuple[Record, List[Permission]], None]:
+        """Yield (SQLViewRecord, permissions) for each view."""
+        for view in views:
+            try:
+                fqn = view.fqn
+                record_id = str(uuid.uuid4())
+                self._record_id_cache[fqn] = record_id
+
+                frontend_url = os.getenv("FRONTEND_PUBLIC_URL", "").rstrip("/")
+                weburl = f"{frontend_url}/record/{record_id}" if frontend_url else ""
+
+                definition = await asyncio.to_thread(
+                    self._fetch_view_definition, database_name, view.name
+                )
+
+                current_time = get_epoch_timestamp_in_ms()
+                record = SQLViewRecord(
+                    id=record_id,
+                    record_name=view.name,
+                    record_type=RecordType.SQL_VIEW,
+                    record_group_type=RecordGroupType.SQL_DATABASE.value,
+                    external_record_group_id=database_name,
+                    external_record_id=fqn,
+                    external_revision_id=str(current_time),
+                    origin=OriginTypes.CONNECTOR.value,
+                    connector_name=self.connector_name,
+                    connector_id=self.connector_id,
+                    mime_type=MimeTypes.SQL_VIEW.value,
+                    weburl=weburl,
+                    source_created_at=current_time,
+                    source_updated_at=current_time,
+                    database_name=database_name,
+                    fqn=fqn,
+                    definition=definition,
+                    is_secure=False,
+                    comment=view.comment,
+                    version=1,
+                    inherit_permissions=True,
+                )
+
+                yield (record, [])
+                await asyncio.sleep(0)
+
+            except Exception as e:
+                self.logger.error(f"Error processing view {view.name}: {e}", exc_info=True)
+                continue
+
+    async def _sync_views(self, database_name: str, views: List[ClickHouseTable]) -> None:
+        """Batch-process views and call on_new_records."""
+        if not views:
+            return
+
+        batch: List[Tuple[Record, List[Permission]]] = []
+        total_synced = 0
+
+        async for record, perms in self._process_views_generator(database_name, views):
+            batch.append((record, perms))
+            total_synced += 1
+
+            if len(batch) >= self.batch_size:
+                self.logger.debug(f"Processing batch of {len(batch)} views")
+                await self.data_entities_processor.on_new_records(batch)
+                batch = []
+
+        if batch:
+            await self.data_entities_processor.on_new_records(batch)
+
+        self.logger.info(f"Synced {total_synced} views in {database_name}")
+
+    async def _sync_updated_views(self, database_name: str, views: List[ClickHouseTable]) -> None:
+        """Sync views whose content or schema has changed."""
+        if not views:
+            return
+
+        self.logger.info(f"Processing {len(views)} updated views in {database_name}")
+
+        for view in views:
+            try:
+                fqn = view.fqn
+
+                existing_record = await self.data_entities_processor.get_record_by_external_id(
+                    connector_id=self.connector_id,
+                    external_record_id=fqn
+                )
+                if not existing_record:
+                    self.logger.warning(f"No existing record found for updated view {fqn}, skipping")
+                    continue
+
+                definition = await asyncio.to_thread(
+                    self._fetch_view_definition, database_name, view.name
+                )
+
+                current_time = get_epoch_timestamp_in_ms()
+
+                updated_record = SQLViewRecord(
+                    id=existing_record.id,
+                    record_name=view.name,
+                    record_type=RecordType.SQL_VIEW,
+                    record_group_type=RecordGroupType.SQL_DATABASE.value,
+                    external_record_group_id=database_name,
+                    external_record_id=fqn,
+                    external_revision_id=str(current_time),
+                    origin=OriginTypes.CONNECTOR.value,
+                    connector_name=self.connector_name,
+                    connector_id=self.connector_id,
+                    mime_type=MimeTypes.SQL_VIEW.value,
+                    weburl=existing_record.weburl if hasattr(existing_record, 'weburl') else "",
+                    source_created_at=existing_record.source_created_at if hasattr(existing_record, 'source_created_at') else current_time,
+                    source_updated_at=current_time,
+                    database_name=database_name,
+                    fqn=fqn,
+                    definition=definition,
+                    is_secure=False,
+                    comment=view.comment,
+                    version=(existing_record.version or 1) + 1,
+                    inherit_permissions=True,
+                )
+
+                await self.data_entities_processor.on_record_content_update(updated_record)
+                self.logger.debug(f"Published content update for view: {fqn}")
+
+            except Exception as e:
+                self.logger.error(f"Error syncing updated view {view.name}: {e}", exc_info=True)
+                continue
+
+        self.logger.info(f"Completed syncing {len(views)} updated views in {database_name}")
+
     # ── Full sync ───────────────────────────────────────────────────────
 
     async def run_sync(self) -> None:
@@ -675,9 +844,9 @@ class ClickHouseConnector(BaseConnector):
 
             await self._create_app_users()
 
-            selected_databases, selected_tables = self._get_filter_values()
+            selected_databases, selected_tables, selected_views = self._get_filter_values()
 
-            databases = self._fetch_databases()
+            databases = await asyncio.to_thread(self._fetch_databases)
 
             if selected_databases:
                 databases = [d for d in databases if d.name in selected_databases]
@@ -686,13 +855,19 @@ class ClickHouseConnector(BaseConnector):
             self.sync_stats.databases_synced = len(databases)
 
             for db in databases:
-                tables = self._fetch_tables(db.name)
+                tables = await asyncio.to_thread(self._fetch_tables, db.name)
+                views = await asyncio.to_thread(self._fetch_views, db.name)
 
                 if selected_tables:
                     tables = [t for t in tables if t.fqn in selected_tables]
+                if selected_views:
+                    views = [v for v in views if v.fqn in selected_views]
 
                 await self._sync_tables(db.name, tables)
                 self.sync_stats.tables_new += len(tables)
+
+                await self._sync_views(db.name, views)
+                self.sync_stats.views_new += len(views)
 
             await self._save_tables_sync_state("clickhouse_tables_state")
 
@@ -728,8 +903,8 @@ class ClickHouseConnector(BaseConnector):
                 stored_state.get("table_states", "{}")
             )
 
-            selected_databases, selected_tables = self._get_filter_values()
-            current_stats = self._get_current_table_states(selected_databases, selected_tables)
+            selected_databases, selected_tables, selected_views = self._get_filter_values()
+            current_stats = await asyncio.to_thread(self._get_current_table_states, selected_databases, selected_tables, selected_views)
 
             current_fqns = set(current_stats.keys())
             stored_fqns = set(stored_table_states.keys())
@@ -766,43 +941,55 @@ class ClickHouseConnector(BaseConnector):
     def _get_current_table_states(
         self,
         selected_databases: Optional[List[str]],
-        selected_tables: Optional[List[str]]
+        selected_tables: Optional[List[str]],
+        selected_views: Optional[List[str]] = None
     ) -> Dict[str, Dict[str, Any]]:
-        """Fetch current table states from ClickHouse for change detection."""
+        """Fetch current table and view states from ClickHouse for change detection."""
         table_states: Dict[str, Dict[str, Any]] = {}
 
-        response = self.data_source.query(
-            query="SELECT database, name, total_rows, total_bytes, "
-                  "metadata_modification_time "
-                  "FROM system.tables "
-                  f"WHERE database NOT IN {SYSTEM_DATABASES} "
-                  "AND is_temporary = 0 "
-                  "ORDER BY database, name"
-        )
-        if not response.success:
-            self.logger.warning(f"Failed to get table stats: {response.error}")
+        db_response = self.data_source.list_databases()
+        if not db_response.success:
+            self.logger.warning(f"Failed to get databases: {db_response.error}")
             return table_states
 
-        column_names = response.data.get("column_names", [])
-        for row in response.data.get("result_rows", []):
-            row_dict = dict(zip(column_names, row))
-            db_name = row_dict["database"]
-            table_name = row_dict["name"]
-            fqn = f"{db_name}.{table_name}"
-
+        for db in (db_response.data or []):
+            db_name = db["name"]
             if selected_databases and db_name not in selected_databases:
                 continue
-            if selected_tables and fqn not in selected_tables:
-                continue
 
-            column_hash = self._compute_column_hash(db_name, table_name)
+            # Fetch tables for this database
+            tbl_response = self.data_source.list_tables(database=db_name)
+            if tbl_response.success:
+                for row_dict in (tbl_response.data or []):
+                    table_name = row_dict["name"]
+                    fqn = f"{db_name}.{table_name}"
+                    if selected_tables and fqn not in selected_tables:
+                        continue
+                    column_hash = self._compute_column_hash(db_name, table_name)
+                    table_states[fqn] = {
+                        "engine": row_dict.get("engine", ""),
+                        "column_hash": column_hash,
+                        "total_rows": row_dict.get("total_rows", 0) or 0,
+                        "total_bytes": row_dict.get("total_bytes", 0) or 0,
+                        "metadata_modification_time": str(row_dict.get("metadata_modification_time", "")),
+                    }
 
-            table_states[fqn] = {
-                "column_hash": column_hash,
-                "total_rows": row_dict.get("total_rows", 0) or 0,
-                "total_bytes": row_dict.get("total_bytes", 0) or 0,
-                "metadata_modification_time": str(row_dict.get("metadata_modification_time", "")),
-            }
+            # Fetch views for this database
+            view_response = self.data_source.list_views(database=db_name)
+            if view_response.success:
+                for row_dict in (view_response.data or []):
+                    view_name = row_dict["name"]
+                    fqn = f"{db_name}.{view_name}"
+                    if selected_views and fqn not in selected_views:
+                        continue
+                    column_hash = self._compute_column_hash(db_name, view_name)
+                    table_states[fqn] = {
+                        "engine": row_dict.get("engine", ""),
+                        "column_hash": column_hash,
+                        "total_rows": 0,
+                        "total_bytes": 0,
+                        "metadata_modification_time": str(row_dict.get("metadata_modification_time", "")),
+                    }
 
         return table_states
 
@@ -835,8 +1022,8 @@ class ClickHouseConnector(BaseConnector):
         return False
 
     async def _sync_new_tables(self, table_fqns: List[str]) -> None:
-        """Sync newly discovered tables."""
-        self.logger.info(f"Syncing {len(table_fqns)} new tables")
+        """Sync newly discovered tables and views."""
+        self.logger.info(f"Syncing {len(table_fqns)} new tables/views")
 
         # Ensure parent database record groups exist
         new_databases = set()
@@ -848,23 +1035,31 @@ class ClickHouseConnector(BaseConnector):
             dbs = [ClickHouseDatabase(name=d) for d in new_databases]
             await self._sync_databases(dbs)
 
-        # Group FQNs by database, then fetch tables once per database
+        # Group FQNs by database, then fetch all objects once per database
         fqns_by_db: Dict[str, List[str]] = {}
         for fqn in table_fqns:
             db_name, table_name = fqn.split(".", 1)
             fqns_by_db.setdefault(db_name, []).append(table_name)
 
         for db_name, table_names in fqns_by_db.items():
-            all_tables = self._fetch_tables(db_name)
             target_names = set(table_names)
-            matching = [t for t in all_tables if t.name in target_names]
-            if matching:
-                await self._sync_tables(db_name, matching)
-                self.sync_stats.tables_new += len(matching)
+
+            tables = await asyncio.to_thread(self._fetch_tables, db_name)
+            views = await asyncio.to_thread(self._fetch_views, db_name)
+
+            new_tables = [t for t in tables if t.name in target_names]
+            new_views = [v for v in views if v.name in target_names]
+
+            if new_tables:
+                await self._sync_tables(db_name, new_tables)
+                self.sync_stats.tables_new += len(new_tables)
+            if new_views:
+                await self._sync_views(db_name, new_views)
+                self.sync_stats.views_new += len(new_views)
 
     async def _sync_changed_tables(self, table_fqns: List[str]) -> None:
-        """Sync tables whose content or schema has changed."""
-        self.logger.info(f"Syncing {len(table_fqns)} changed tables")
+        """Sync tables/views whose content or schema has changed."""
+        self.logger.info(f"Syncing {len(table_fqns)} changed tables/views")
 
         fqns_by_db: Dict[str, List[str]] = {}
         for fqn in table_fqns:
@@ -872,11 +1067,18 @@ class ClickHouseConnector(BaseConnector):
             fqns_by_db.setdefault(db_name, []).append(table_name)
 
         for db_name, table_names in fqns_by_db.items():
-            all_tables = self._fetch_tables(db_name)
             target_names = set(table_names)
-            matching = [t for t in all_tables if t.name in target_names]
-            if matching:
-                await self._sync_updated_tables(db_name, matching)
+
+            tables = await asyncio.to_thread(self._fetch_tables, db_name)
+            views = await asyncio.to_thread(self._fetch_views, db_name)
+
+            changed_tables = [t for t in tables if t.name in target_names]
+            changed_views = [v for v in views if v.name in target_names]
+
+            if changed_tables:
+                await self._sync_updated_tables(db_name, changed_tables)
+            if changed_views:
+                await self._sync_updated_views(db_name, changed_views)
 
     async def _handle_deleted_tables(self, table_fqns: List[str]) -> None:
         """Handle tables that no longer exist in the database."""
@@ -896,8 +1098,8 @@ class ClickHouseConnector(BaseConnector):
 
     async def _save_tables_sync_state(self, sync_point_key: str) -> None:
         """Save current table states for next incremental sync comparison."""
-        selected_databases, selected_tables = self._get_filter_values()
-        current_states = self._get_current_table_states(selected_databases, selected_tables)
+        selected_databases, selected_tables, selected_views = self._get_filter_values()
+        current_states = self._get_current_table_states(selected_databases, selected_tables, selected_views)
         count = len(current_states)
         current_states_json = json.dumps(current_states, default=str)
         await self.tables_sync_point.update_sync_point(
@@ -927,18 +1129,20 @@ class ClickHouseConnector(BaseConnector):
                     raise HTTPException(status_code=500, detail="Invalid table FQN")
                 database, table = parts[0], parts[1]
 
-                columns = self._fetch_columns(database, table)
+                columns = await asyncio.to_thread(self._fetch_columns, database, table)
                 self.logger.info(f"Retrieved {len(columns)} columns for {database}.{table}")
 
-                rows = self._fetch_table_rows(database, table)
+                rows = await asyncio.to_thread(self._fetch_table_rows, database, table)
 
                 # Fetch DDL
                 ddl = ""
-                ddl_response = self.data_source.command(
-                    cmd=f"SHOW CREATE TABLE `{database}`.`{table}`"
+                ddl_response = await asyncio.to_thread(
+                    self.data_source.get_table_ddl,
+                    database=database,
+                    table=table
                 )
                 if ddl_response.success:
-                    ddl = str(ddl_response.data.get("result", ""))
+                    ddl = str(ddl_response.data.get("ddl", ""))
 
                 primary_keys = [c["name"] for c in columns if c.get("is_in_primary_key")]
                 order_by = [c["name"] for c in columns if c.get("is_in_sorting_key")]
@@ -963,6 +1167,63 @@ class ClickHouseConnector(BaseConnector):
                     json_iterator(), filename=f"{table}.json", mime_type=MimeTypes.SQL_TABLE.value
                 )
 
+            elif record.record_type == RecordType.SQL_VIEW:
+                parts = record.external_record_id.split(".")
+                if len(parts) != 2:
+                    raise HTTPException(status_code=500, detail="Invalid view FQN")
+                database, view_name = parts[0], parts[1]
+
+                columns = await asyncio.to_thread(self._fetch_columns, database, view_name)
+                self.logger.info(f"Retrieved {len(columns)} columns for view {database}.{view_name}")
+
+                # Fetch DDL (also serves as view definition)
+                ddl = ""
+                definition = ""
+                ddl_response = await asyncio.to_thread(
+                    self.data_source.get_table_ddl,
+                    database=database,
+                    table=view_name
+                )
+                if ddl_response.success:
+                    ddl = str(ddl_response.data.get("ddl", ""))
+                    definition = ddl
+
+                # Determine engine to decide whether to fetch sample rows
+                # MaterializedView stores data, so we can fetch rows; View is a proxy
+                rows = []
+                engine = ""
+                constraints_response = await asyncio.to_thread(
+                    self.data_source.get_table_constraints,
+                    database=database,
+                    table=view_name
+                )
+                if constraints_response.success:
+                    table_info = constraints_response.data.get("table_info", {})
+                    engine = table_info.get("engine", "")
+
+                if engine == "MaterializedView":
+                    rows = await asyncio.to_thread(self._fetch_table_rows, database, view_name)
+
+                data = {
+                    "view_name": view_name,
+                    "database_name": database,
+                    "engine": engine,
+                    "definition": definition,
+                    "columns": columns,
+                    "rows": rows,
+                    "ddl": ddl,
+                    "connector_name": self.connector_name.value if hasattr(self.connector_name, "value") else str(self.connector_name),
+                }
+
+                json_bytes = json.dumps(data, default=str).encode("utf-8")
+
+                async def view_json_iterator():
+                    yield json_bytes
+
+                return create_stream_record_response(
+                    view_json_iterator(), filename=f"{view_name}.json", mime_type=MimeTypes.SQL_VIEW.value
+                )
+
             raise HTTPException(status_code=400, detail="Unsupported record type")
 
         except Exception as e:
@@ -975,7 +1236,7 @@ class ClickHouseConnector(BaseConnector):
         if not self.data_source:
             return False
         try:
-            response = self.data_source.ping()
+            response = await asyncio.to_thread(self.data_source.ping)
             if response.success:
                 self.logger.info("ClickHouse connection test successful")
                 return True
@@ -1068,6 +1329,8 @@ class ClickHouseConnector(BaseConnector):
                 return await self._get_database_options(page, limit, search)
             elif filter_key == "tables":
                 return await self._get_table_options(page, limit, search)
+            elif filter_key == "views":
+                return await self._get_view_options(page, limit, search)
             else:
                 return FilterOptionsResponse(
                     success=False,
@@ -1105,7 +1368,7 @@ class ClickHouseConnector(BaseConnector):
             )
 
         try:
-            response = self.data_source.query(query="SELECT name FROM system.databases ORDER BY name")
+            response = self.data_source.list_databases()
 
             if not response.success:
                 return FilterOptionsResponse(
@@ -1117,7 +1380,7 @@ class ClickHouseConnector(BaseConnector):
                     message=response.error or "Failed to fetch databases"
                 )
 
-            databases = [row[0] for row in response.data.get("result_rows", [])]
+            databases = [db["name"] for db in (response.data or [])]
 
             if search:
                 databases = [d for d in databases if search.lower() in d.lower()]
@@ -1164,21 +1427,24 @@ class ClickHouseConnector(BaseConnector):
             )
 
         try:
-            response = self.data_source.query(
-                query="SELECT database, name FROM system.tables WHERE database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema') ORDER BY database, name"
-            )
-
-            if not response.success:
+            db_response = self.data_source.list_databases()
+            if not db_response.success:
                 return FilterOptionsResponse(
                     success=False,
                     options=[],
                     page=page,
                     limit=limit,
                     has_more=False,
-                    message=response.error or "Failed to fetch tables"
+                    message=db_response.error or "Failed to fetch databases"
                 )
 
-            all_tables = [f"{row[0]}.{row[1]}" for row in response.data.get("result_rows", [])]
+            all_tables = []
+            for db in (db_response.data or []):
+                db_name = db["name"]
+                tbl_response = self.data_source.list_tables(database=db_name)
+                if tbl_response.success:
+                    for t in (tbl_response.data or []):
+                        all_tables.append(f"{db_name}.{t['name']}")
 
             if search:
                 all_tables = [t for t in all_tables if search.lower() in t.lower()]
@@ -1199,6 +1465,70 @@ class ClickHouseConnector(BaseConnector):
 
         except Exception as e:
             self.logger.error(f"Error getting table options: {e}", exc_info=True)
+            return FilterOptionsResponse(
+                success=False,
+                options=[],
+                page=page,
+                limit=limit,
+                has_more=False,
+                message=str(e)
+            )
+
+    async def _get_view_options(
+        self,
+        page: int,
+        limit: int,
+        search: Optional[str] = None
+    ) -> FilterOptionsResponse:
+        if not self.data_source:
+            return FilterOptionsResponse(
+                success=False,
+                options=[],
+                page=page,
+                limit=limit,
+                has_more=False,
+                message="ClickHouse data source not initialized"
+            )
+
+        try:
+            db_response = self.data_source.list_databases()
+            if not db_response.success:
+                return FilterOptionsResponse(
+                    success=False,
+                    options=[],
+                    page=page,
+                    limit=limit,
+                    has_more=False,
+                    message=db_response.error or "Failed to fetch databases"
+                )
+
+            all_views = []
+            for db in (db_response.data or []):
+                db_name = db["name"]
+                view_response = self.data_source.list_views(database=db_name)
+                if view_response.success:
+                    for v in (view_response.data or []):
+                        all_views.append(f"{db_name}.{v['name']}")
+
+            if search:
+                all_views = [v for v in all_views if search.lower() in v.lower()]
+
+            start = (page - 1) * limit
+            end = start + limit
+            paginated = all_views[start:end]
+
+            options = [FilterOption(id=fqn, label=fqn) for fqn in paginated]
+
+            return FilterOptionsResponse(
+                success=True,
+                options=options,
+                page=page,
+                limit=limit,
+                has_more=end < len(all_views)
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error getting view options: {e}", exc_info=True)
             return FilterOptionsResponse(
                 success=False,
                 options=[],

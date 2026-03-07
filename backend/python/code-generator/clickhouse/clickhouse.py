@@ -657,6 +657,196 @@ CLICKHOUSE_ORG_API_METHODS = {
 
 
 # ================================================================================
+# METADATA HELPER METHOD DEFINITIONS
+# ================================================================================
+
+CLICKHOUSE_METADATA_METHODS = {
+    'list_databases': {
+        'description': 'List all user databases, excluding system and information_schema databases',
+        'queries': [
+            {
+                'sql': (
+                    "SELECT name, engine, data_path, uuid "
+                    "FROM system.databases "
+                    "WHERE name NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema') "
+                    "ORDER BY name"
+                ),
+                'parameters': {},
+            },
+        ],
+        'method_params': [],
+        'required': [],
+        'returns_description': 'List of database dicts with name, engine, data_path, uuid',
+        'message_template': 'Successfully listed {count} databases',
+        'error_message': 'Failed to list databases',
+    },
+
+    'list_tables': {
+        'description': 'List all tables in a database, excluding temporary tables',
+        'queries': [
+            {
+                'sql': (
+                    "SELECT name, engine, total_rows, total_bytes, "
+                    "metadata_modification_time, create_table_query, comment "
+                    "FROM system.tables "
+                    "WHERE database = {db:String} "
+                    "AND is_temporary = 0 "
+                    "AND engine NOT IN ('View', 'MaterializedView') "
+                    "ORDER BY name"
+                ),
+                'parameters': {'db': 'database'},
+            },
+        ],
+        'method_params': [
+            {'name': 'database', 'type': 'str', 'description': 'Database name to list tables from'},
+        ],
+        'required': ['database'],
+        'returns_description': 'List of table dicts with name, engine, total_rows, total_bytes, comment, etc.',
+        'message_template': 'Successfully listed {count} tables in database',
+        'error_message': 'Failed to list tables',
+    },
+
+    'list_views': {
+        'description': 'List all views (View and MaterializedView) in a database',
+        'queries': [
+            {
+                'sql': (
+                    "SELECT name, engine, create_table_query, "
+                    "metadata_modification_time "
+                    "FROM system.tables "
+                    "WHERE database = {db:String} "
+                    "AND engine IN ('View', 'MaterializedView') "
+                    "ORDER BY name"
+                ),
+                'parameters': {'db': 'database'},
+            },
+        ],
+        'method_params': [
+            {'name': 'database', 'type': 'str', 'description': 'Database name to list views from'},
+        ],
+        'required': ['database'],
+        'returns_description': 'List of view dicts with name, engine, create_table_query, etc.',
+        'message_template': 'Successfully listed {count} views in database',
+        'error_message': 'Failed to list views',
+    },
+
+    'get_table_schema': {
+        'description': 'Get column schema information for a table including types, positions, and key columns',
+        'queries': [
+            {
+                'sql': (
+                    "SELECT name, type, position, default_kind, default_expression, "
+                    "comment, is_in_partition_key, is_in_sorting_key, is_in_primary_key, "
+                    "is_in_sampling_key "
+                    "FROM system.columns "
+                    "WHERE database = {db:String} AND table = {tbl:String} "
+                    "ORDER BY position"
+                ),
+                'parameters': {'db': 'database', 'tbl': 'table'},
+            },
+        ],
+        'method_params': [
+            {'name': 'database', 'type': 'str', 'description': 'Database name'},
+            {'name': 'table', 'type': 'str', 'description': 'Table name'},
+        ],
+        'required': ['database', 'table'],
+        'returns_description': 'List of column dicts with name, type, position, key membership, etc.',
+        'message_template': 'Successfully retrieved schema with {count} columns',
+        'error_message': 'Failed to get table schema',
+    },
+
+    'get_table_constraints': {
+        'description': 'Get constraint information for a table including primary key, sorting key, and engine details',
+        'queries': [
+            {
+                'sql': (
+                    "SELECT name FROM system.columns "
+                    "WHERE database = {db:String} AND table = {tbl:String} "
+                    "AND is_in_primary_key = 1 ORDER BY position"
+                ),
+                'parameters': {'db': 'database', 'tbl': 'table'},
+                'result_key': 'primary_key_columns',
+            },
+            {
+                'sql': (
+                    "SELECT name FROM system.columns "
+                    "WHERE database = {db:String} AND table = {tbl:String} "
+                    "AND is_in_sorting_key = 1 ORDER BY position"
+                ),
+                'parameters': {'db': 'database', 'tbl': 'table'},
+                'result_key': 'sorting_key_columns',
+            },
+            {
+                'sql': (
+                    "SELECT engine, engine_full, partition_key, sorting_key, "
+                    "primary_key, sampling_key "
+                    "FROM system.tables "
+                    "WHERE database = {db:String} AND name = {tbl:String}"
+                ),
+                'parameters': {'db': 'database', 'tbl': 'table'},
+                'result_key': 'table_info',
+            },
+        ],
+        'multi_query': True,
+        'method_params': [
+            {'name': 'database', 'type': 'str', 'description': 'Database name'},
+            {'name': 'table', 'type': 'str', 'description': 'Table name'},
+        ],
+        'required': ['database', 'table'],
+        'returns_description': 'Dict with primary_key_columns, sorting_key_columns, and table_info',
+        'message_template': 'Successfully retrieved constraints for table',
+        'error_message': 'Failed to get table constraints',
+    },
+
+    'list_users': {
+        'description': 'List all users configured in the ClickHouse server',
+        'queries': [
+            {
+                'sql': (
+                    "SELECT name, storage, auth_type, host_ip, host_names "
+                    "FROM system.users ORDER BY name"
+                ),
+                'parameters': {},
+            },
+        ],
+        'method_params': [],
+        'required': [],
+        'returns_description': 'List of user dicts with name, storage, auth_type, host_ip, host_names',
+        'message_template': 'Successfully listed {count} users',
+        'error_message': 'Failed to list users',
+    },
+
+    'list_roles': {
+        'description': 'List all roles configured in the ClickHouse server',
+        'queries': [
+            {
+                'sql': "SELECT name, storage FROM system.roles ORDER BY name",
+                'parameters': {},
+            },
+        ],
+        'method_params': [],
+        'required': [],
+        'returns_description': 'List of role dicts with name and storage',
+        'message_template': 'Successfully listed {count} roles',
+        'error_message': 'Failed to list roles',
+    },
+
+    'get_table_ddl': {
+        'description': 'Get the CREATE TABLE DDL statement for a table',
+        'use_command': True,
+        'method_params': [
+            {'name': 'database', 'type': 'str', 'description': 'Database name'},
+            {'name': 'table', 'type': 'str', 'description': 'Table name'},
+        ],
+        'required': ['database', 'table'],
+        'returns_description': 'Dict with ddl key containing the CREATE TABLE statement',
+        'message_template': 'Successfully retrieved DDL for table',
+        'error_message': 'Failed to get table DDL',
+    },
+}
+
+
+# ================================================================================
 # GENERATOR CLASS
 # ================================================================================
 
@@ -1034,6 +1224,157 @@ class ClickHouseDataSourceGenerator:
 
         return "\n".join(lines)
 
+    # ================================================================================
+    # METADATA HELPER METHOD GENERATION
+    # ================================================================================
+
+    def _generate_metadata_method_signature(self, method_name: str, method_info: Dict) -> str:
+        """Generate sync method signature for a metadata helper method."""
+        params = ["self"]
+
+        for param in method_info.get('method_params', []):
+            params.append(f"{param['name']}: {param['type']}")
+
+        signature_params = ",\n        ".join(params)
+        return f"    def {method_name}(\n        {signature_params}\n    ) -> ClickHouseResponse:"
+
+    def _generate_metadata_method_docstring(self, method_info: Dict) -> List[str]:
+        """Generate docstring for a metadata helper method."""
+        lines = [f'        """{method_info["description"]}', ""]
+
+        method_params = method_info.get('method_params', [])
+        if method_params:
+            lines.append("        Args:")
+            for param in method_params:
+                lines.append(f"            {param['name']}: {param['description']}")
+            lines.append("")
+
+        lines.extend([
+            "        Returns:",
+            f"            ClickHouseResponse: {method_info['returns_description']}",
+        ])
+        lines.append('        """')
+        return lines
+
+    def _generate_metadata_method_body(self, method_name: str, method_info: Dict) -> List[str]:
+        """Generate the body of a metadata helper method."""
+        lines = []
+        error_msg = method_info['error_message']
+        success_msg = method_info['message_template']
+
+        if method_info.get('use_command'):
+            # DDL method using self._sdk.command()
+            lines.extend([
+                "        try:",
+                "            result = self._sdk.command(",
+                "                f\"SHOW CREATE TABLE `{database}`.`{table}`\"",
+                "            )",
+                "            return ClickHouseResponse(",
+                "                success=True,",
+                "                data={'ddl': result},",
+                f"                message='{success_msg}'",
+                "            )",
+                "        except Exception as e:",
+                f"            return ClickHouseResponse(success=False, error=str(e), message='{error_msg}')",
+            ])
+        elif method_info.get('multi_query'):
+            # Multi-query method (get_table_constraints)
+            lines.append("        try:")
+            lines.append("            result = {}")
+
+            for query_info in method_info['queries']:
+                result_key = query_info['result_key']
+                sql = query_info['sql']
+                param_mapping = query_info.get('parameters', {})
+
+                # Build parameters dict
+                if param_mapping:
+                    param_parts = ", ".join(f"'{k}': {v}" for k, v in param_mapping.items())
+                    param_str = f"{{{param_parts}}}"
+                else:
+                    param_str = "{}"
+
+                lines.append("")
+                lines.append(f"            query_result = self._sdk.query(")
+                lines.append(f"                \"{sql}\",")
+                lines.append(f"                parameters={param_str}")
+                lines.append(f"            )")
+
+                if result_key == 'table_info':
+                    # Single row result - return as dict
+                    lines.extend([
+                        "            if query_result.result_rows:",
+                        "                row = query_result.result_rows[0]",
+                        "                col_names = list(query_result.column_names)",
+                        f"                result['{result_key}'] = dict(zip(col_names, row))",
+                        "            else:",
+                        f"                result['{result_key}'] = {{}}",
+                    ])
+                else:
+                    # List of single-column values
+                    lines.extend([
+                        f"            result['{result_key}'] = [row[0] for row in query_result.result_rows]",
+                    ])
+
+            lines.extend([
+                "",
+                "            return ClickHouseResponse(",
+                "                success=True,",
+                "                data=result,",
+                f"                message='{success_msg}'",
+                "            )",
+                "        except Exception as e:",
+                f"            return ClickHouseResponse(success=False, error=str(e), message='{error_msg}')",
+            ])
+        else:
+            # Single query method
+            query_info = method_info['queries'][0]
+            sql = query_info['sql']
+            param_mapping = query_info.get('parameters', {})
+
+            if param_mapping:
+                param_parts = ", ".join(f"'{k}': {v}" for k, v in param_mapping.items())
+                param_str = f"{{{param_parts}}}"
+            else:
+                param_str = "{}"
+
+            lines.extend([
+                "        try:",
+                f"            result = self._sdk.query(",
+                f"                \"{sql}\",",
+                f"                parameters={param_str}",
+                f"            )",
+                "            rows = [",
+                "                dict(zip(list(result.column_names), row))",
+                "                for row in result.result_rows",
+                "            ]",
+                "            return ClickHouseResponse(",
+                "                success=True,",
+                "                data=rows,",
+                f"                message='{success_msg}'.replace('{{count}}', str(len(rows)))",
+                "            )",
+                "        except Exception as e:",
+                f"            return ClickHouseResponse(success=False, error=str(e), message='{error_msg}')",
+            ])
+
+        return lines
+
+    def _generate_metadata_method(self, method_name: str, method_info: Dict) -> str:
+        """Generate a complete metadata helper method."""
+        lines = []
+
+        lines.append(self._generate_metadata_method_signature(method_name, method_info))
+        lines.extend(self._generate_metadata_method_docstring(method_info))
+        lines.extend(self._generate_metadata_method_body(method_name, method_info))
+
+        self.generated_methods.append({
+            'name': method_name,
+            'description': method_info['description'],
+            'return_handling': 'metadata',
+        })
+
+        return "\n".join(lines)
+
     def generate_datasource(self) -> str:
         """Generate the complete ClickHouse datasource class."""
 
@@ -1072,6 +1413,7 @@ class ClickHouseDataSourceGenerator:
             '    - Raw data operations (raw_query, raw_insert, raw_stream)',
             '    - Context and utility methods',
             '    - Cloud Organization API operations (list/get/update orgs, activities, BYOC)',
+            '    - Metadata helpers (list databases/tables/views, schema, constraints, DDL, users, roles)',
             '',
             '    All methods have explicit parameter signatures - NO **kwargs.',
             '    Methods that return structured results return ClickHouseResponse objects.',
@@ -1118,6 +1460,16 @@ class ClickHouseDataSourceGenerator:
             class_lines.append(self._generate_org_api_method(method_name, method_info))
             class_lines.append("")
 
+        # Generate Metadata helper methods
+        class_lines.append("    # ================================================================================")
+        class_lines.append("    # METADATA HELPER METHODS (sync, query system tables)")
+        class_lines.append("    # ================================================================================")
+        class_lines.append("")
+
+        for method_name, method_info in CLICKHOUSE_METADATA_METHODS.items():
+            class_lines.append(self._generate_metadata_method(method_name, method_info))
+            class_lines.append("")
+
         return "\n".join(class_lines)
 
     def save_to_file(self, filename: Optional[str] = None) -> None:
@@ -1148,11 +1500,14 @@ class ClickHouseDataSourceGenerator:
             'Utility': 0,
             'Command': 0,
             'Cloud Org API': 0,
+            'Metadata': 0,
         }
 
         for method in self.generated_methods:
             name = method['name']
-            if method.get('return_handling') == 'org_api':
+            if method.get('return_handling') == 'metadata':
+                categories['Metadata'] += 1
+            elif method.get('return_handling') == 'org_api':
                 categories['Cloud Org API'] += 1
             elif 'stream' in name:
                 categories['Streaming'] += 1

@@ -32,6 +32,7 @@ class ClickHouseDataSource:
     - Raw data operations (raw_query, raw_insert, raw_stream)
     - Context and utility methods
     - Cloud Organization API operations (list/get/update orgs, activities, BYOC)
+    - Metadata helpers (list databases/tables/views, schema, constraints, DDL, users, roles)
 
     All methods have explicit parameter signatures - NO **kwargs.
     Methods that return structured results return ClickHouseResponse objects.
@@ -1769,3 +1770,245 @@ class ClickHouseDataSource:
             )
         except Exception as e:
             return ClickHouseResponse(success=False, error=str(e), message='Failed to call update_byoc_infrastructure')
+
+    # ================================================================================
+    # METADATA HELPER METHODS (sync, query system tables)
+    # ================================================================================
+
+    def list_databases(
+        self
+    ) -> ClickHouseResponse:
+        """List all user databases, excluding system and information_schema databases
+
+        Returns:
+            ClickHouseResponse: List of database dicts with name, engine, data_path, uuid
+        """
+        try:
+            result = self._sdk.query(
+                "SELECT name, engine, data_path, uuid FROM system.databases WHERE name NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema') ORDER BY name",
+                parameters={}
+            )
+            rows = [
+                dict(zip(list(result.column_names), row))
+                for row in result.result_rows
+            ]
+            return ClickHouseResponse(
+                success=True,
+                data=rows,
+                message='Successfully listed {count} databases'.replace('{count}', str(len(rows)))
+            )
+        except Exception as e:
+            return ClickHouseResponse(success=False, error=str(e), message='Failed to list databases')
+
+    def list_tables(
+        self,
+        database: str
+    ) -> ClickHouseResponse:
+        """List all tables in a database, excluding temporary tables
+
+        Args:
+            database: Database name to list tables from
+
+        Returns:
+            ClickHouseResponse: List of table dicts with name, engine, total_rows, total_bytes, comment, etc.
+        """
+        try:
+            result = self._sdk.query(
+                "SELECT name, engine, total_rows, total_bytes, metadata_modification_time, create_table_query, comment FROM system.tables WHERE database = {db:String} AND is_temporary = 0 AND engine NOT IN ('View', 'MaterializedView') ORDER BY name",
+                parameters={'db': database}
+            )
+            rows = [
+                dict(zip(list(result.column_names), row))
+                for row in result.result_rows
+            ]
+            return ClickHouseResponse(
+                success=True,
+                data=rows,
+                message='Successfully listed {count} tables in database'.replace('{count}', str(len(rows)))
+            )
+        except Exception as e:
+            return ClickHouseResponse(success=False, error=str(e), message='Failed to list tables')
+
+    def list_views(
+        self,
+        database: str
+    ) -> ClickHouseResponse:
+        """List all views (View and MaterializedView) in a database
+
+        Args:
+            database: Database name to list views from
+
+        Returns:
+            ClickHouseResponse: List of view dicts with name, engine, create_table_query, etc.
+        """
+        try:
+            result = self._sdk.query(
+                "SELECT name, engine, create_table_query, metadata_modification_time FROM system.tables WHERE database = {db:String} AND engine IN ('View', 'MaterializedView') ORDER BY name",
+                parameters={'db': database}
+            )
+            rows = [
+                dict(zip(list(result.column_names), row))
+                for row in result.result_rows
+            ]
+            return ClickHouseResponse(
+                success=True,
+                data=rows,
+                message='Successfully listed {count} views in database'.replace('{count}', str(len(rows)))
+            )
+        except Exception as e:
+            return ClickHouseResponse(success=False, error=str(e), message='Failed to list views')
+
+    def get_table_schema(
+        self,
+        database: str,
+        table: str
+    ) -> ClickHouseResponse:
+        """Get column schema information for a table including types, positions, and key columns
+
+        Args:
+            database: Database name
+            table: Table name
+
+        Returns:
+            ClickHouseResponse: List of column dicts with name, type, position, key membership, etc.
+        """
+        try:
+            result = self._sdk.query(
+                "SELECT name, type, position, default_kind, default_expression, comment, is_in_partition_key, is_in_sorting_key, is_in_primary_key, is_in_sampling_key FROM system.columns WHERE database = {db:String} AND table = {tbl:String} ORDER BY position",
+                parameters={'db': database, 'tbl': table}
+            )
+            rows = [
+                dict(zip(list(result.column_names), row))
+                for row in result.result_rows
+            ]
+            return ClickHouseResponse(
+                success=True,
+                data=rows,
+                message='Successfully retrieved schema with {count} columns'.replace('{count}', str(len(rows)))
+            )
+        except Exception as e:
+            return ClickHouseResponse(success=False, error=str(e), message='Failed to get table schema')
+
+    def get_table_constraints(
+        self,
+        database: str,
+        table: str
+    ) -> ClickHouseResponse:
+        """Get constraint information for a table including primary key, sorting key, and engine details
+
+        Args:
+            database: Database name
+            table: Table name
+
+        Returns:
+            ClickHouseResponse: Dict with primary_key_columns, sorting_key_columns, and table_info
+        """
+        try:
+            result = {}
+
+            query_result = self._sdk.query(
+                "SELECT name FROM system.columns WHERE database = {db:String} AND table = {tbl:String} AND is_in_primary_key = 1 ORDER BY position",
+                parameters={'db': database, 'tbl': table}
+            )
+            result['primary_key_columns'] = [row[0] for row in query_result.result_rows]
+
+            query_result = self._sdk.query(
+                "SELECT name FROM system.columns WHERE database = {db:String} AND table = {tbl:String} AND is_in_sorting_key = 1 ORDER BY position",
+                parameters={'db': database, 'tbl': table}
+            )
+            result['sorting_key_columns'] = [row[0] for row in query_result.result_rows]
+
+            query_result = self._sdk.query(
+                "SELECT engine, engine_full, partition_key, sorting_key, primary_key, sampling_key FROM system.tables WHERE database = {db:String} AND name = {tbl:String}",
+                parameters={'db': database, 'tbl': table}
+            )
+            if query_result.result_rows:
+                row = query_result.result_rows[0]
+                col_names = list(query_result.column_names)
+                result['table_info'] = dict(zip(col_names, row))
+            else:
+                result['table_info'] = {}
+
+            return ClickHouseResponse(
+                success=True,
+                data=result,
+                message='Successfully retrieved constraints for table'
+            )
+        except Exception as e:
+            return ClickHouseResponse(success=False, error=str(e), message='Failed to get table constraints')
+
+    def list_users(
+        self
+    ) -> ClickHouseResponse:
+        """List all users configured in the ClickHouse server
+
+        Returns:
+            ClickHouseResponse: List of user dicts with name, storage, auth_type, host_ip, host_names
+        """
+        try:
+            result = self._sdk.query(
+                "SELECT name, storage, auth_type, host_ip, host_names FROM system.users ORDER BY name",
+                parameters={}
+            )
+            rows = [
+                dict(zip(list(result.column_names), row))
+                for row in result.result_rows
+            ]
+            return ClickHouseResponse(
+                success=True,
+                data=rows,
+                message='Successfully listed {count} users'.replace('{count}', str(len(rows)))
+            )
+        except Exception as e:
+            return ClickHouseResponse(success=False, error=str(e), message='Failed to list users')
+
+    def list_roles(
+        self
+    ) -> ClickHouseResponse:
+        """List all roles configured in the ClickHouse server
+
+        Returns:
+            ClickHouseResponse: List of role dicts with name and storage
+        """
+        try:
+            result = self._sdk.query(
+                "SELECT name, storage FROM system.roles ORDER BY name",
+                parameters={}
+            )
+            rows = [
+                dict(zip(list(result.column_names), row))
+                for row in result.result_rows
+            ]
+            return ClickHouseResponse(
+                success=True,
+                data=rows,
+                message='Successfully listed {count} roles'.replace('{count}', str(len(rows)))
+            )
+        except Exception as e:
+            return ClickHouseResponse(success=False, error=str(e), message='Failed to list roles')
+
+    def get_table_ddl(
+        self,
+        database: str,
+        table: str
+    ) -> ClickHouseResponse:
+        """Get the CREATE TABLE DDL statement for a table
+
+        Args:
+            database: Database name
+            table: Table name
+
+        Returns:
+            ClickHouseResponse: Dict with ddl key containing the CREATE TABLE statement
+        """
+        try:
+            result = self._sdk.command(
+                f"SHOW CREATE TABLE `{database}`.`{table}`"
+            )
+            return ClickHouseResponse(
+                success=True,
+                data={'ddl': result},
+                message='Successfully retrieved DDL for table'
+            )
+        except Exception as e:
+            return ClickHouseResponse(success=False, error=str(e), message='Failed to get table DDL')

@@ -15,6 +15,7 @@ ClickHouse API example demonstrating:
 13. Cleanup (DROP users, roles, tables, databases)
 14. Connection close
 15. Cloud Organization API (list orgs, get org details)
+16. Metadata Helpers (list_databases, list_tables, list_views, get_table_schema, etc.)
 """
 import asyncio
 import os
@@ -739,6 +740,142 @@ async def get_organization_details(ds: ClickHouseDataSource, org_id: str) -> Cli
 
 
 # ---------------------------------------------------------------------------
+# 16. Metadata Helpers
+# ---------------------------------------------------------------------------
+
+def test_metadata_list_databases(ds: ClickHouseDataSource) -> None:
+    """Test list_databases() metadata helper."""
+    print("\n" + "=" * 60)
+    print("16. METADATA HELPERS - list_databases()")
+    print("=" * 60)
+
+    response = ds.list_databases()
+    if response.success:
+        databases = response.data if response.data else []
+        print(f"  Found {len(databases)} user database(s):")
+        for db in databases:
+            print(f"    - {db.get('name', 'N/A')} (engine: {db.get('engine', 'N/A')})")
+    else:
+        print(f"  Failed: {response.error}")
+
+
+def test_metadata_list_tables(ds: ClickHouseDataSource, db_name: str) -> None:
+    """Test list_tables() metadata helper."""
+    print("\n" + "=" * 60)
+    print(f"16. METADATA HELPERS - list_tables('{db_name}')")
+    print("=" * 60)
+
+    response = ds.list_tables(database=db_name)
+    if response.success:
+        tables = response.data if response.data else []
+        print(f"  Found {len(tables)} table(s):")
+        for t in tables:
+            print(f"    - {t.get('name', 'N/A')} (engine: {t.get('engine', 'N/A')}, rows: {t.get('total_rows', 'N/A')})")
+    else:
+        print(f"  Failed: {response.error}")
+
+
+def test_metadata_list_views(ds: ClickHouseDataSource, db_name: str) -> None:
+    """Test list_views() metadata helper."""
+    print("\n" + "=" * 60)
+    print(f"16. METADATA HELPERS - list_views('{db_name}')")
+    print("=" * 60)
+
+    response = ds.list_views(database=db_name)
+    if response.success:
+        views = response.data if response.data else []
+        print(f"  Found {len(views)} view(s):")
+        for v in views:
+            print(f"    - {v.get('name', 'N/A')} (engine: {v.get('engine', 'N/A')})")
+    else:
+        print(f"  Failed: {response.error}")
+
+
+def test_metadata_get_table_schema(ds: ClickHouseDataSource, db_name: str, table_name: str) -> None:
+    """Test get_table_schema() metadata helper."""
+    print("\n" + "=" * 60)
+    print(f"16. METADATA HELPERS - get_table_schema('{db_name}', '{table_name}')")
+    print("=" * 60)
+
+    response = ds.get_table_schema(database=db_name, table=table_name)
+    if response.success:
+        columns = response.data if response.data else []
+        print(f"  Found {len(columns)} column(s):")
+        for col in columns:
+            pk = " [PK]" if col.get('is_in_primary_key') else ""
+            sk = " [SK]" if col.get('is_in_sorting_key') else ""
+            print(f"    - {col.get('name', 'N/A')}: {col.get('type', 'N/A')}{pk}{sk}")
+    else:
+        print(f"  Failed: {response.error}")
+
+
+def test_metadata_get_table_constraints(ds: ClickHouseDataSource, db_name: str, table_name: str) -> None:
+    """Test get_table_constraints() metadata helper."""
+    print("\n" + "=" * 60)
+    print(f"16. METADATA HELPERS - get_table_constraints('{db_name}', '{table_name}')")
+    print("=" * 60)
+
+    response = ds.get_table_constraints(database=db_name, table=table_name)
+    if response.success and response.data:
+        data = response.data
+        print(f"  Primary key columns: {data.get('primary_key_columns', [])}")
+        print(f"  Sorting key columns: {data.get('sorting_key_columns', [])}")
+        info = data.get('table_info', {})
+        if info:
+            print(f"  Engine: {info.get('engine', 'N/A')}")
+            print(f"  Partition key: {info.get('partition_key', 'N/A')}")
+            print(f"  Sorting key: {info.get('sorting_key', 'N/A')}")
+    else:
+        print(f"  Failed: {response.error}")
+
+
+def test_metadata_list_users(ds: ClickHouseDataSource) -> None:
+    """Test list_users() metadata helper."""
+    print("\n" + "=" * 60)
+    print("16. METADATA HELPERS - list_users()")
+    print("=" * 60)
+
+    response = ds.list_users()
+    if response.success:
+        users = response.data if response.data else []
+        print(f"  Found {len(users)} user(s):")
+        for u in users:
+            print(f"    - {u.get('name', 'N/A')} (auth: {u.get('auth_type', 'N/A')})")
+    else:
+        print(f"  Failed: {response.error}")
+
+
+def test_metadata_list_roles(ds: ClickHouseDataSource) -> None:
+    """Test list_roles() metadata helper."""
+    print("\n" + "=" * 60)
+    print("16. METADATA HELPERS - list_roles()")
+    print("=" * 60)
+
+    response = ds.list_roles()
+    if response.success:
+        roles = response.data if response.data else []
+        print(f"  Found {len(roles)} role(s):")
+        for r in roles:
+            print(f"    - {r.get('name', 'N/A')} (storage: {r.get('storage', 'N/A')})")
+    else:
+        print(f"  Failed: {response.error}")
+
+
+def test_metadata_get_table_ddl(ds: ClickHouseDataSource, db_name: str, table_name: str) -> None:
+    """Test get_table_ddl() metadata helper."""
+    print("\n" + "=" * 60)
+    print(f"16. METADATA HELPERS - get_table_ddl('{db_name}', '{table_name}')")
+    print("=" * 60)
+
+    response = ds.get_table_ddl(database=db_name, table=table_name)
+    if response.success and response.data:
+        ddl = response.data.get('ddl', '')
+        print(f"  DDL:\n    {ddl}")
+    else:
+        print(f"  Failed: {response.error}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -852,6 +989,16 @@ async def main() -> None:
         # 12. Grant Roles
         grant_roles_to_users(ds)
         list_role_grants(ds)
+
+        # 16. Metadata Helpers
+        test_metadata_list_databases(ds)
+        test_metadata_list_tables(ds, TEST_DB)
+        test_metadata_list_views(ds, TEST_DB)
+        test_metadata_get_table_schema(ds, TEST_DB, TEST_TABLE)
+        test_metadata_get_table_constraints(ds, TEST_DB, TEST_TABLE)
+        test_metadata_list_users(ds)
+        test_metadata_list_roles(ds)
+        test_metadata_get_table_ddl(ds, TEST_DB, TEST_TABLE)
 
         # 15. Cloud Organization API
         orgs_response = await list_organizations(ds)

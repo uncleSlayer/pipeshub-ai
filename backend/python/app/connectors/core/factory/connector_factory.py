@@ -58,6 +58,7 @@ from app.connectors.sources.zammad.connector import ZammadConnector
 
 from app.connectors.sources.snowflake.connector import SnowflakeConnector
 from app.connectors.sources.postgres.connector import PostgreSQLConnector
+from app.connectors.sources.clickhouse.connector import ClickHouseConnector
 
 class ConnectorFactory:
     """Generic factory for creating and managing connectors"""
@@ -88,6 +89,7 @@ class ConnectorFactory:
         "azureblob": AzureBlobConnector,
         "azurefiles": AzureFilesConnector,
         "postgresql": PostgreSQLConnector,
+        "clickhouse": ClickHouseConnector,
         "linear": LinearConnector,
         "notion": NotionConnector,
         "zammad": ZammadConnector,
