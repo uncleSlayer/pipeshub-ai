@@ -81,22 +81,26 @@ VIEW_ENGINES = ('View', 'MaterializedView')
 class SyncStats:
     databases_synced: int = 0
     tables_new: int = 0
+    tables_updated: int = 0
     views_new: int = 0
+    views_updated: int = 0
     errors: int = 0
 
     def to_dict(self) -> Dict[str, int]:
         return {
             'databases_synced': self.databases_synced,
             'tables_new': self.tables_new,
+            'tables_updated': self.tables_updated,
             'views_new': self.views_new,
+            'views_updated': self.views_updated,
             'errors': self.errors,
         }
 
     def log_summary(self, logger) -> None:
         logger.info(
             f"Sync Stats: "
-            f"Databases={self.databases_synced}, Tables(new={self.tables_new}), "
-            f"Views(new={self.views_new}) | "
+            f"Databases={self.databases_synced}, Tables(new={self.tables_new}, updated={self.tables_updated}), "
+            f"Views(new={self.views_new}, updated={self.views_updated}) | "
             f"Errors={self.errors}"
         )
 
@@ -327,6 +331,7 @@ class ClickHouseConnector(BaseConnector):
         self.indexing_filters: FilterCollection = FilterCollection()
         self._record_id_cache: Dict[str, str] = {}
         self.sync_stats: SyncStats = SyncStats()
+        self._clickhouse_base_url: str = ""
 
         # Initialize sync point for incremental sync
         org_id = self.data_entities_processor.org_id
@@ -379,9 +384,19 @@ class ClickHouseConnector(BaseConnector):
             )
             self.data_source = ClickHouseDataSource(client)
 
-            self.database_name = config.get("database", "default")
-            self.connector_scope = config.get("scope", ConnectorScope.PERSONAL.value)
+            auth_config = config.get("auth") or {}
+            self.database_name = auth_config.get("database", "default")
+            self.connector_scope = auth_config.get("connectorScope", config.get("scope", ConnectorScope.PERSONAL.value))
             self.created_by = config.get("created_by")
+
+            # Build base URL for ClickHouse dashboard links
+            host = auth_config.get("host", "localhost")
+            port = int(auth_config.get("port", 8123))
+            secure = auth_config.get("secure", False)
+            if isinstance(secure, str):
+                secure = secure.lower() in ("true", "1", "yes")
+            scheme = "https" if secure else "http"
+            self._clickhouse_base_url = f"{scheme}://{host}:{port}"
 
             self.sync_filters, self.indexing_filters = await load_connector_filters(
                 self.config_service, "clickhouse", self.connector_id, self.logger
@@ -407,6 +422,14 @@ class ClickHouseConnector(BaseConnector):
         selected_views = view_filter.value if view_filter and view_filter.value else None
 
         return selected_databases, selected_tables, selected_views
+
+    def _build_dashboard_url(self, database: str, table: str) -> str:
+        """Build a ClickHouse Play UI URL for the given database and table."""
+        if not self._clickhouse_base_url:
+            return ""
+        query = f"SELECT * FROM `{database}`.`{table}` LIMIT 100"
+        from urllib.parse import quote
+        return f"{self._clickhouse_base_url}/play#query={quote(query)}"
 
     async def _get_permissions(self) -> List[Permission]:
         return [Permission(
@@ -547,8 +570,7 @@ class ClickHouseConnector(BaseConnector):
                 record_id = str(uuid.uuid4())
                 self._record_id_cache[fqn] = record_id
 
-                frontend_url = os.getenv("FRONTEND_PUBLIC_URL", "").rstrip("/")
-                weburl = f"{frontend_url}/record/{record_id}" if frontend_url else ""
+                weburl = self._build_dashboard_url(database_name, table.name)
 
                 current_time = get_epoch_timestamp_in_ms()
                 record = SQLTableRecord(
@@ -641,7 +663,7 @@ class ClickHouseConnector(BaseConnector):
                     connector_name=self.connector_name,
                     connector_id=self.connector_id,
                     mime_type=MimeTypes.SQL_TABLE.value,
-                    weburl=existing_record.weburl if hasattr(existing_record, 'weburl') else "",
+                    weburl=self._build_dashboard_url(database_name, table.name),
                     source_created_at=existing_record.source_created_at if hasattr(existing_record, 'source_created_at') else current_time,
                     source_updated_at=current_time,
                     database_name=database_name,
@@ -687,8 +709,7 @@ class ClickHouseConnector(BaseConnector):
                 record_id = str(uuid.uuid4())
                 self._record_id_cache[fqn] = record_id
 
-                frontend_url = os.getenv("FRONTEND_PUBLIC_URL", "").rstrip("/")
-                weburl = f"{frontend_url}/record/{record_id}" if frontend_url else ""
+                weburl = self._build_dashboard_url(database_name, view.name)
 
                 definition = await asyncio.to_thread(
                     self._fetch_view_definition, database_name, view.name
@@ -785,7 +806,7 @@ class ClickHouseConnector(BaseConnector):
                     connector_name=self.connector_name,
                     connector_id=self.connector_id,
                     mime_type=MimeTypes.SQL_VIEW.value,
-                    weburl=existing_record.weburl if hasattr(existing_record, 'weburl') else "",
+                    weburl=self._build_dashboard_url(database_name, view.name),
                     source_created_at=existing_record.source_created_at if hasattr(existing_record, 'source_created_at') else current_time,
                     source_updated_at=current_time,
                     database_name=database_name,
@@ -1077,8 +1098,10 @@ class ClickHouseConnector(BaseConnector):
 
             if changed_tables:
                 await self._sync_updated_tables(db_name, changed_tables)
+                self.sync_stats.tables_updated += len(changed_tables)
             if changed_views:
                 await self._sync_updated_views(db_name, changed_views)
+                self.sync_stats.views_updated += len(changed_views)
 
     async def _handle_deleted_tables(self, table_fqns: List[str]) -> None:
         """Handle tables that no longer exist in the database."""
@@ -1099,7 +1122,7 @@ class ClickHouseConnector(BaseConnector):
     async def _save_tables_sync_state(self, sync_point_key: str) -> None:
         """Save current table states for next incremental sync comparison."""
         selected_databases, selected_tables, selected_views = self._get_filter_values()
-        current_states = self._get_current_table_states(selected_databases, selected_tables, selected_views)
+        current_states = await asyncio.to_thread(self._get_current_table_states, selected_databases, selected_tables, selected_views)
         count = len(current_states)
         current_states_json = json.dumps(current_states, default=str)
         await self.tables_sync_point.update_sync_point(
