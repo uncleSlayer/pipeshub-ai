@@ -17,7 +17,7 @@ import logging
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app.config.configuration_service import ConfigurationService
 from app.sources.client.http.http_client import HTTPClient
@@ -35,26 +35,38 @@ class AuthType(str, Enum):
     """Authentication type for ClickHouse connector."""
 
     CREDENTIALS = "CREDENTIALS"
+    BASIC_AUTH = "BASIC_AUTH"
     TOKEN = "TOKEN"
 
 
 class AuthConfig(BaseModel):
     """Authentication configuration for ClickHouse connector."""
 
-    authType: AuthType = Field(default=AuthType.CREDENTIALS, description="Authentication type (CREDENTIALS or TOKEN)")
+    host: str = Field(..., description="ClickHouse server hostname")
+    port: int = Field(default=8123, description="HTTP interface port")
+    database: str = Field(default="default", description="Default database")
+    secure: bool = Field(default=False, description="Use HTTPS")
+    authType: AuthType = Field(default=AuthType.CREDENTIALS, description="Authentication type")
     username: Optional[str] = Field(default=None, description="ClickHouse username for credentials auth")
     password: Optional[str] = Field(default=None, description="ClickHouse password for credentials auth")
     token: Optional[str] = Field(default=None, description="Bearer token for token auth")
+
+    @field_validator("secure", mode="before")
+    @classmethod
+    def parse_secure(cls, v: Any) -> bool:
+        if isinstance(v, str):
+            return v.lower() in ("true", "1", "yes")
+        return bool(v)
+
+    @property
+    def is_credentials_auth(self) -> bool:
+        return self.authType in (AuthType.CREDENTIALS, AuthType.BASIC_AUTH)
 
 
 class ClickHouseConnectorConfig(BaseModel):
     """Configuration model for ClickHouse connector from services."""
 
-    host: str = Field(..., description="ClickHouse server hostname")
-    port: int = Field(default=8123, description="HTTP interface port")
-    database: str = Field(default="default", description="Default database")
-    secure: bool = Field(default=False, description="Use HTTPS")
-    auth: AuthConfig = Field(default_factory=AuthConfig, description="Authentication configuration")
+    auth: AuthConfig = Field(..., description="Authentication configuration")
     timeout: float = Field(default=30.0, description="Request timeout in seconds", gt=0)
 
 
@@ -349,13 +361,12 @@ class ClickHouseClient(IClient):
 
             config = ClickHouseConnectorConfig.model_validate(config_dict)
 
-            auth_type = config.auth.authType
-            host = config.host
-            port = config.port
-            database = config.database
-            secure = config.secure
+            host = config.auth.host
+            port = config.auth.port
+            database = config.auth.database
+            secure = config.auth.secure
 
-            if auth_type == AuthType.CREDENTIALS:
+            if config.auth.is_credentials_auth:
                 username = config.auth.username or "default"
                 password = config.auth.password or ""
                 client = ClickHouseClientViaCredentials(
@@ -377,7 +388,7 @@ class ClickHouseClient(IClient):
                     timeout=config.timeout,
                 )
 
-            elif auth_type == AuthType.TOKEN:
+            elif config.auth.authType == AuthType.TOKEN:
                 if not config.auth.token:
                     raise ValueError("Bearer token required for TOKEN auth type")
                 client = ClickHouseClientViaToken(
@@ -398,7 +409,7 @@ class ClickHouseClient(IClient):
                 )
 
             else:
-                raise ValueError(f"Unsupported auth type: {auth_type}")
+                raise ValueError(f"Unsupported auth type: {config.auth.authType}")
 
             return cls(client=client, http_client=http_client)
 

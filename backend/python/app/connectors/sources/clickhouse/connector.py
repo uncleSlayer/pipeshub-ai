@@ -70,7 +70,7 @@ from app.utils.time_conversion import get_epoch_timestamp_in_ms
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
-CLICKHOUSE_TABLE_ROW_LIMIT = int(os.getenv("CLICKHOUSE_TABLE_ROW_LIMIT", "1000"))
+CLICKHOUSE_TABLE_ROW_LIMIT = int(os.getenv("CLICKHOUSE_TABLE_ROW_LIMIT", "1000000"))
 
 SYSTEM_DATABASES = ('system', 'INFORMATION_SCHEMA', 'information_schema')
 
@@ -952,6 +952,9 @@ class ClickHouseConnector(BaseConnector):
             if deleted_tables:
                 await self._handle_deleted_tables(deleted_tables)
 
+            # Retry records stuck in EMPTY state from previous sync failures
+            await self._retry_stuck_records()
+
             await self._save_tables_sync_state(sync_point_key)
             self.logger.info("[Incremental Sync] ClickHouse incremental sync completed")
 
@@ -1118,6 +1121,110 @@ class ClickHouseConnector(BaseConnector):
                     self.logger.debug(f"Deleted record for table: {fqn}")
             except Exception as e:
                 self.logger.warning(f"Failed to delete record for {fqn}: {e}")
+
+    async def _retry_stuck_records(self) -> None:
+        """Retry records stuck in EMPTY state from previous sync failures."""
+        try:
+            org_id = self.data_entities_processor.org_id
+            async with self.data_store_provider.transaction() as tx_store:
+                stuck_records = await tx_store.get_records_by_status(
+                    org_id=org_id,
+                    connector_id=self.connector_id,
+                    status_filters=[IndexingStatus.EMPTY.value],
+                )
+
+            if not stuck_records:
+                return
+
+            self.logger.info(f"[Incremental Sync] Found {len(stuck_records)} records stuck in EMPTY state, retrying...")
+
+            for record in stuck_records:
+                try:
+                    fqn = record.external_record_id
+                    if not fqn or "." not in fqn:
+                        continue
+
+                    db_name, obj_name = fqn.split(".", 1)
+                    current_time = get_epoch_timestamp_in_ms()
+
+                    if record.record_type == RecordType.SQL_TABLE:
+                        tables = await asyncio.to_thread(self._fetch_tables, db_name)
+                        table = next((t for t in tables if t.name == obj_name), None)
+                        if not table:
+                            self.logger.debug(f"Table {fqn} no longer exists, skipping retry")
+                            continue
+
+                        updated_record = SQLTableRecord(
+                            id=record.id,
+                            record_name=table.name,
+                            record_type=RecordType.SQL_TABLE,
+                            record_group_type=RecordGroupType.SQL_DATABASE.value,
+                            external_record_group_id=db_name,
+                            external_record_id=fqn,
+                            external_revision_id=str(current_time),
+                            origin=OriginTypes.CONNECTOR.value,
+                            connector_name=self.connector_name,
+                            connector_id=self.connector_id,
+                            mime_type=MimeTypes.SQL_TABLE.value,
+                            weburl=self._build_dashboard_url(db_name, table.name),
+                            source_created_at=record.source_created_at or current_time,
+                            source_updated_at=current_time,
+                            database_name=db_name,
+                            row_count=table.row_count,
+                            size_bytes=table.total_bytes,
+                            column_count=len(table.columns),
+                            primary_keys=table.primary_keys,
+                            comment=table.comment,
+                            version=(record.version or 1) + 1,
+                            inherit_permissions=True,
+                        )
+
+                    elif record.record_type == RecordType.SQL_VIEW:
+                        views = await asyncio.to_thread(self._fetch_views, db_name)
+                        view = next((v for v in views if v.name == obj_name), None)
+                        if not view:
+                            self.logger.debug(f"View {fqn} no longer exists, skipping retry")
+                            continue
+
+                        definition = await asyncio.to_thread(
+                            self._fetch_view_definition, db_name, view.name
+                        )
+
+                        updated_record = SQLViewRecord(
+                            id=record.id,
+                            record_name=view.name,
+                            record_type=RecordType.SQL_VIEW,
+                            record_group_type=RecordGroupType.SQL_DATABASE.value,
+                            external_record_group_id=db_name,
+                            external_record_id=fqn,
+                            external_revision_id=str(current_time),
+                            origin=OriginTypes.CONNECTOR.value,
+                            connector_name=self.connector_name,
+                            connector_id=self.connector_id,
+                            mime_type=MimeTypes.SQL_VIEW.value,
+                            weburl=self._build_dashboard_url(db_name, view.name),
+                            source_created_at=record.source_created_at or current_time,
+                            source_updated_at=current_time,
+                            database_name=db_name,
+                            fqn=fqn,
+                            definition=definition,
+                            is_secure=False,
+                            comment=view.comment,
+                            version=(record.version or 1) + 1,
+                            inherit_permissions=True,
+                        )
+                    else:
+                        continue
+
+                    await self.data_entities_processor.on_record_content_update(updated_record)
+                    self.logger.info(f"Retried stuck record: {fqn}")
+
+                except Exception as e:
+                    self.logger.warning(f"Failed to retry stuck record {record.external_record_id}: {e}")
+                    continue
+
+        except Exception as e:
+            self.logger.warning(f"Failed to check for stuck records: {e}")
 
     async def _save_tables_sync_state(self, sync_point_key: str) -> None:
         """Save current table states for next incremental sync comparison."""
