@@ -9,7 +9,13 @@ class AnswerWithMetadataDict(TypedDict):
     answer: str
     reason: str
     confidence: Literal["Very High", "High", "Medium", "Low"]
-    answerMatchType: Literal["Exact Match", "Derived From Blocks", "Derived From User Info", "Enhanced With Full Record"]
+    answerMatchType: Literal[
+        "Exact Match",
+        "Derived From Blocks",
+        "Derived From User Info",
+        "Enhanced With Full Record",
+        "Derived From Tool Execution",
+    ]
     blockNumbers: List[str]
 
 class AnswerWithMetadataJSON(BaseModel):
@@ -17,7 +23,13 @@ class AnswerWithMetadataJSON(BaseModel):
     answer: str
     reason: str
     confidence: Literal["Very High", "High", "Medium", "Low"]
-    answerMatchType: Literal["Exact Match", "Derived From Blocks", "Derived From User Info", "Enhanced With Full Record"]
+    answerMatchType: Literal[
+        "Exact Match",
+        "Derived From Blocks",
+        "Derived From User Info",
+        "Enhanced With Full Record",
+        "Derived From Tool Execution",
+    ]
     blockNumbers: List[str]
 
 qna_prompt = """
@@ -229,6 +241,9 @@ qna_prompt_instructions_2 = """
   - You can integrate user information with the context to answer the query where user information is highly relevant to the query
   - IMPORTANT:ENSURE THAT DOCUMENT RECORDS REFERENCED IN THE ANSWER ARE ACTUALLY RELEVANT TO THE QUERY AND ANSWER. FOR EXAMPLE, ORGANIZATION OF USER IS ACCOUNTED IN THE USER INFORMATION. HE MIGHT BE ASKING QUERIES ABOUT HIS ORGANIZATION DOCUMENTS BUT OTHER ORGANIZATION DOCUMENTS MIGHT BE RETRIEVED DURING SEARCH.
   - **Balanced Tool Usage**: The provided blocks are optimized semantic search results. Use them when adequate, but don't hesitate to fetch full records when they would materially improve answer quality.
+  {% if has_mcp_tools %}
+  - **MCP Tools Available**: You also have access to external tools (e.g. MCP servers) that can fetch live data from third-party services (Notion, Slack, GitHub, Drive, Jira, etc.). If the user's query is better answered by calling one of these tools than by using the provided blocks, call the tool and answer from its result. See Section 7 below for the contract.
+  {% endif %}
 
   -Guidelines-
   When answering queries, follow these guidelines:
@@ -241,8 +256,14 @@ qna_prompt_instructions_2 = """
   - Generate rich markdown text for the answer including tables, lists, bold, italic, sub sections, etc.
   - Do not summarize or omit important details
 
+  {% if not has_mcp_tools %}
   2. Citations (REQUIRED for all block-derived answers, including follow-ups):
   - Every factual claim derived from blocks MUST be immediately followed by its citation in the SAME sentence
+  {% else %}
+  2. Citations (REQUIRED whenever your answer uses provided blocks; NOT required when your answer comes entirely from external tool results):
+  - If any factual claim in your answer is derived from a block, it MUST be immediately followed by its citation in the SAME sentence
+  - If your answer comes entirely from an external tool result, do NOT fabricate block citations — leave `blockNumbers` as `[]`
+  {% endif %}
   - Use square brackets with one citation per bracket: [R1-1], [R2-3]
   - Place citations after the specific claim they support, not at the end of paragraphs
   - Include only the top 4-5 most relevant block citations per answer
@@ -251,7 +272,11 @@ qna_prompt_instructions_2 = """
   - When a code block ends, put citations on the next line after ```, not on the same line
   - Ensure cited block numbers appear in the `blockNumbers` field
 
+  {% if has_mcp_tools %}
+  3. Internal Knowledge Tool Usage (`fetch_full_record`):
+  {% else %}
   3. Tool Usage Strategy (FOLLOW THIS DECISION TREE):
+  {% endif %}
   - **STEP 1 - Evaluate completeness:** Ask yourself: "Can I provide a COMPLETE and COMPREHENSIVE answer with just these blocks? Does query demand FULL CONTENT from the record?"
   - **STEP 2 - Identify gaps:** Look for:
     * Missing context or background information. Use block numbers to detect gaps.
@@ -277,26 +302,41 @@ qna_prompt_instructions_2 = """
   5. Source Prioritization:
   - For user-specific queries (identity, role, workplace), use the User Information section
   - If neither Current Query Context nor User Information contains the answer, use the fetch_full_record tool before stating "Information not found in your knowledge sources"
+  {% if has_mcp_tools %}
+  - If the query is about live data from an external service (e.g. Notion pages, Slack messages, GitHub issues, Jira tickets, calendar events, Google Drive files) and an appropriate external tool exists, call that tool directly instead of trying to answer from blocks
+  {% endif %}
 
   6. Multi-query handling:
       i. Identify and number each distinct query in the user's query
       ii. For any query that cannot be answered with current blocks, attempt to use fetch_full_record tool
       iii. Only if still insufficient after tool use, say "Based on the available information, I cannot answer this specific query"
       iv. Ensure all queries receive equal attention with proper citations
+
+  {% if has_mcp_tools %}
+  7. External Tool Answers (MCP / live-data tools):
+  - When you call an external tool, treat its response as the AUTHORITATIVE source. Do not second-guess it. Do not refuse. Do not say "I tried but couldn't".
+  - The answer to the user MUST be derived from the tool's response. Use the actual values returned (names, IDs, URLs, statuses) verbatim.
+  - Put ALL tool-derived content INLINE inside the `answer` field as rich markdown: titles, descriptions, tables, and clickable markdown links like `[PA-123](https://org.atlassian.net/browse/PA-123)`. Do NOT invent a new schema field for reference data.
+  - For each external item you mention, include its URL as a markdown link when the tool response contains one. For Jira issue keys, Confluence pages, Drive files, Gmail messages, Slack channels: always format as `[Label](url)` when a URL exists.
+  - Do NOT add block citation markers like `[R1-2]` for tool-derived content. Block citations are only for internal knowledge blocks shown in the context above.
+  - When your answer is ENTIRELY from tool results (no internal blocks used): set `answerMatchType` to `"Derived From Tool Execution"` and set `blockNumbers` to `[]`.
+  - When your answer combines internal blocks AND tool results: cite blocks inline with `[R1-2]` style, populate `blockNumbers` with the cited blocks, and set `answerMatchType` to `"Derived From Blocks"` (blocks take precedence in the labeling). Weave both sources into one coherent answer; do not emit two separate sections.
+  - NEVER return raw tool output — transform it into clean, user-friendly markdown. Hide internal UUIDs and system metadata. Show names, keys, dates, statuses, URLs.
+  {% endif %}
 </instructions>
 
 <output_format>
   {% if mode == "json" %}
   Output format:
   {
-    "answer": "<Answer the query in rich markdown format with citations like [R1-1][R2-3] placed immediately after each relevant claim. If based only on user data, say 'User Information'>",
+    "answer": "<Answer the query in rich markdown format. When content is derived from blocks, place citations like [R1-1][R2-3] immediately after each relevant claim. When content is derived from external tool results, embed clickable markdown links like [Label](url) inline. If based only on user data, say 'User Information'>",
     "reason": "<Explain how the answer was derived using the blocks/user information/tool results and reasoning>",
     "confidence": "<Very High | High | Medium | Low>",
-    "answerMatchType": "<Exact Match | Derived From Blocks | Derived From User Info | Enhanced With Full Record>",
+    "answerMatchType": "<Exact Match | Derived From Blocks | Derived From User Info | Enhanced With Full Record{% if has_mcp_tools %} | Derived From Tool Execution{% endif %}>",
     "blockNumbers": [<verbatimBlockNumber>]
   }
   <example>
-  ✅ Example Output:
+  ✅ Example Output (answer derived from internal blocks):
     {
       "answer": "Security policies are regularly reviewed [R1-2]. Updates are implemented quarterly [R2-5].",
       "reason": "Derived from block number R1-2 which mentions review frequency, and R2-5 which specifies the update schedule.",
@@ -305,6 +345,18 @@ qna_prompt_instructions_2 = """
       "blockNumbers": ["R1-2", "R2-5"]
     }
   </example>
+  {% if has_mcp_tools %}
+  <example>
+  ✅ Example Output (answer derived from external tool execution):
+    {
+      "answer": "Here are the open issues assigned to you:\\n\\n| Key | Summary | Status | Priority |\\n|---|---|---|---|\\n| [PA-123](https://org.atlassian.net/browse/PA-123) | Fix login bug | In Progress | High |\\n| [PA-145](https://org.atlassian.net/browse/PA-145) | Update docs | To Do | Medium |",
+      "reason": "Called the Jira search tool with assignee=currentUser and status!=Done; transformed the result into a markdown table with clickable issue links.",
+      "confidence": "High",
+      "answerMatchType": "Derived From Tool Execution",
+      "blockNumbers": []
+    }
+  </example>
+  {% endif %}
   {% else %}
   Output format:
   Provide your answer directly in rich markdown format with citations like [R1-1][R2-3] placed immediately after each relevant claim.

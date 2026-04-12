@@ -559,7 +559,7 @@ async def execute_tool_calls(
                         "record_info": tool_result.get("record_info", {})
                     }
                 }
-                if "records" in tool_result:
+                if tool_result.get("result_type") == "rag" and "records" in tool_result:
                     records.extend(tool_result.get("records", []))
             else:
                 logger.warning(
@@ -647,7 +647,14 @@ async def execute_tool_calls(
 
         for tool_result in tool_results_inner:
             if tool_result.get("ok"):
-                tool_msg = {
+                # Dispatch on the explicit result_type marker set by the tool
+                # itself. RAG tools ("fetch_full_record") return result_type="rag"
+                # and get wrapped in the chatbot's records/record_count envelope
+                # (with message_contents built above from record_to_message_content).
+                # Anything else (MCP, unmarked generic tools) passes through
+                # verbatim so the LLM sees the tool's real payload.
+                if tool_result.get("result_type") == "rag":
+                    tool_msg = {
                         "ok": True,
                         "records": message_contents,
                         "record_count": tool_result.get("record_count", None),
@@ -656,8 +663,13 @@ async def execute_tool_calls(
                         "column_count": tool_result.get("column_count", None),
                         "not_found": tool_result.get("not_found", None),
                     }
+                else:
+                    tool_msg = {
+                        k: v
+                        for k, v in tool_result.items()
+                        if k not in ("tool_name", "call_id")
+                    }
 
-                # tool_msgs.append(HumanMessage(content=f"Full record: {message_content}"))
                 tool_msgs.append(ToolMessage(content=json.dumps(tool_msg), tool_call_id=tool_result["call_id"]))
             else:
                 tool_msg = {
@@ -1283,6 +1295,9 @@ async def stream_llm_response_with_tools(
     target_words_per_chunk: int = 1,
     mode: Optional[str] = "json",
     is_agent: bool = False,  # Use is_agent flag instead of schema
+    max_hops: int = 1,  # Tool-loop ceiling. 1 is enough for single-shot RAG;
+                        # multi-step flows (e.g. MCP search→act) need more.
+                        # The chatbot caller bumps this when MCP tools are present.
     conversation_id: Optional[str] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """
@@ -1309,14 +1324,16 @@ async def stream_llm_response_with_tools(
     )
     records = []
 
-    # Force tools to None in simple mode to avoid any tool-related issues
+    # Tool execution requires the structured JSON output path — the RAG
+    # envelope, citation processing, and reflection loop all depend on it.
+    # In simple mode we strip tools so nothing tries to run them.
     if mode != "json":
         tools = None
         tool_runtime_kwargs = None
-        logger.debug("stream_llm_response_with_tools: simple mode detected, ignoring tools")
+        logger.debug("stream_llm_response_with_tools: mode != 'json', tools disabled")
 
-    # Handle tool calls first if tools are provided (only in JSON mode)
-    if tools and tool_runtime_kwargs and mode == "json":
+    # Handle tool calls first if tools are provided
+    if tools and tool_runtime_kwargs:
         # Execute tools and get updated messages
         final_messages = messages.copy()
         tools_were_called = False
@@ -1337,7 +1354,8 @@ async def stream_llm_response_with_tools(
                 org_id=org_id,
                 context_length=context_length,
                 is_multimodal_llm=is_multimodal_llm,
-                is_agent=is_agent  # Pass is_agent flag through to execute_tool_calls
+                is_agent=is_agent,  # Pass is_agent flag through to execute_tool_calls
+                max_hops=max_hops,
             ):
 
                 if tool_event.get("event") == "tool_execution_complete":

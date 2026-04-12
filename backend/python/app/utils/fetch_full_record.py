@@ -41,9 +41,12 @@ async def _fetch_multiple_records_impl(
     Returns:
     {
       "ok": true,
+      "result_type": "rag",      # marker used by execute_tool_calls dispatch
       "records": [...],
-      "not_found": [...]  # IDs that weren't found
+      "record_count": N,
+      "not_found": [...]         # IDs that weren't found (optional)
     }
+    or {"ok": false, "error": "..."} on failure.
     """
     records = list(virtual_record_id_to_result.values())
 
@@ -60,6 +63,7 @@ async def _fetch_multiple_records_impl(
     if found_records:
         result = {
             "ok": True,
+            "result_type": "rag",
             "records": found_records,
             "record_count": len(found_records)
         }
@@ -87,7 +91,7 @@ def create_fetch_full_record_tool(virtual_record_id_to_result: Dict[str, Any]) -
             reason: Clear explanation of why the full records are needed
 
         Returns:
-        {"ok": true, "records": [...], "record_count": N, "not_found": [...]}
+        {"ok": true, "result_type": "rag", "records": [...], "record_count": N, "not_found": [...]}
         or {"ok": false, "error": "..."}.
         """
         try:

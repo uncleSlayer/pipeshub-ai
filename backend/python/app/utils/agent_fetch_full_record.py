@@ -6,7 +6,10 @@ handles full-record retrieval.  The chatbot flow is:
 
   1. LLM calls fetch_full_record with R-labels ("R1", "R2") or UUIDs.
   2. stream_llm_response_with_tools → execute_tool_calls runs the tool.
-  3. The tool returns {"ok": True, "records": [raw_record_dict, ...]}.
+  3. The tool returns {"ok": True, "result_type": "rag", "records": [...]}.
+     The "result_type" marker tells execute_tool_calls to route this result
+     through the RAG envelope path (records/record_count/...) instead of the
+     generic passthrough path used for MCP/other tools.
   4. execute_tool_calls calls record_to_message_content(record, final_results)
      on each raw record — producing formatted R-block text.
   5. Formatted text is placed into a ToolMessage for the LLM.
@@ -155,7 +158,7 @@ def create_agent_fetch_full_record_tool(
             reason:     Why the full records are needed.
 
         Returns:
-            {"ok": true, "records": [...], "record_count": N}
+            {"ok": true, "result_type": "rag", "records": [...], "record_count": N, "not_found": [...]}
             or {"ok": false, "error": "..."}
         """
         try:
@@ -176,6 +179,7 @@ def create_agent_fetch_full_record_tool(
 
             result: Dict[str, Any] = {
                 "ok": True,
+                "result_type": "rag",
                 # stream_llm_response_with_tools → execute_tool_calls reads the
                 # "records" key and passes each dict through
                 # record_to_message_content(record, final_results) to produce

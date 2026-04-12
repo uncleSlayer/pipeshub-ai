@@ -1174,7 +1174,7 @@ Record blocks (sorted):\n\n"""
         raise Exception(f"Error in record_to_message_content: {e}") from e
 
 
-def get_message_content(flattened_results: List[Dict[str, Any]], virtual_record_id_to_result: Dict[str, Any], user_data: str, query: str, logger, mode: str = "json") -> str:
+def get_message_content(flattened_results: List[Dict[str, Any]], virtual_record_id_to_result: Dict[str, Any], user_data: str, query: str, logger, mode: str = "json", has_mcp_tools: bool = False) -> str:
     content = []
 
     # Use simple prompt for quick mode
@@ -1327,9 +1327,12 @@ def get_message_content(flattened_results: List[Dict[str, Any]], virtual_record_
             else:
                 continue
 
-        # Render instructions_2 with mode parameter
+        # Render instructions_2 with mode parameter and has_mcp_tools flag.
+        # has_mcp_tools controls conditional branches in the template: when True,
+        # the template softens citation requirements and emits Section 7 +
+        # a second output example for tool-derived answers.
         template_instructions_2 = Template(qna_prompt_instructions_2)
-        rendered_instructions_2 = template_instructions_2.render(mode=mode)
+        rendered_instructions_2 = template_instructions_2.render(mode=mode, has_mcp_tools=has_mcp_tools)
 
         content.append({
             "type": "text",

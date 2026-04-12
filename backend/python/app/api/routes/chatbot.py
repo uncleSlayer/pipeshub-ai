@@ -34,6 +34,54 @@ DEFAULT_CONTEXT_LENGTH = 128000
 
 router = APIRouter()
 
+
+async def _load_user_mcp_connections(
+    org_id: str,
+    user_id: str,
+    config_service: ConfigurationService,
+    logger,
+) -> List[dict]:
+    """Load and decrypt every MCP connection registered by a user.
+
+    Used by the Assistant tab where there is no agent record to tell us which
+    MCP servers to use — we list all tokens stored under the user's MCP prefix
+    in etcd and return them as connection dicts ready for McpToolProvider.
+    Failures are soft-fail per-connection.
+    """
+    import asyncio as _asyncio
+
+    from app.agents.tools.mcp.constants import get_mcp_user_connections_prefix
+    from app.agents.tools.mcp.types import McpConnectionInfo
+
+    prefix = get_mcp_user_connections_prefix(org_id, user_id)
+    try:
+        keys = await config_service.list_keys_in_directory(prefix)
+    except Exception as e:
+        logger.warning(f"Could not list MCP connections for user {user_id}: {e}")
+        return []
+
+    token_keys = [k for k in (keys or []) if k.endswith("/token")]
+    if not token_keys:
+        return []
+
+    async def _load_one(key: str) -> Optional[dict]:
+        try:
+            stored = await config_service.get_config(key)
+            if not stored:
+                return None
+            # The encrypted store already decrypted the wrapper and parsed
+            # JSON, so `stored` is the plaintext StoredTokenData dict.
+            return McpConnectionInfo.from_stored_token(dict(stored)).to_dict()
+        except Exception as e:
+            logger.warning(f"Failed to load MCP connection at {key}: {e}")
+            return None
+
+    results = await _asyncio.gather(*[_load_one(k) for k in token_keys])
+    connections = [c for c in results if c is not None]
+    if connections:
+        logger.info(f"Loaded {len(connections)} MCP connection(s) for user {user_id} (Assistant)")
+    return connections
+
 # Pydantic models
 class ChatQuery(BaseModel):
     query: str
@@ -504,6 +552,7 @@ async def askAIStream(
         raise HTTPException(status_code=400, detail=f"Invalid request parameters: {str(e)}")
 
     async def generate_stream() -> AsyncGenerator[str, None]:
+        mcp_session_manager = None
         try:
             container = request.app.container
             logger = container.logger()
@@ -644,13 +693,62 @@ async def askAIStream(
                     elif conversation.get("role") == "bot_response":
                         messages.append({"role": "assistant", "content": conversation.get("content")})
 
-                # Always add the current query with retrieved context as the final user message
-                content = get_message_content(final_results, virtual_record_id_to_result, user_data, query_info.query, logger, query_info.mode)
-                messages.append({"role": "user", "content": content})
-
-                # Prepare tools
+                # Prepare base toolset: RAG fetch is always available.
                 fetch_tool = create_fetch_full_record_tool(virtual_record_id_to_result)
                 tools = [fetch_tool]
+                mcp_tools = []
+
+                # Discover user's MCP tools before building the user message, so
+                # get_message_content() can emit the tool-answer contract section
+                # when any are present. Soft-fail per connection — MCP discovery
+                # failure must not break the RAG path.
+                try:
+                    mcp_connections_data = await _load_user_mcp_connections(
+                        org_id=org_id,
+                        user_id=user_id,
+                        config_service=config_service,
+                        logger=logger,
+                    )
+                    if mcp_connections_data:
+                        from app.agents.tools.mcp import McpSessionManager, McpToolProvider
+                        from app.agents.tools.mcp.session_manager import TokenRefreshContext
+                        from app.agents.tools.mcp.types import McpConnectionInfo
+
+                        token_context = TokenRefreshContext(
+                            config_service=config_service,
+                            encryption_service=config_service.encryption_service,
+                            org_id=org_id,
+                            user_id=user_id,
+                        )
+                        mcp_session_manager = McpSessionManager(logger, token_context=token_context)
+                        connections = [McpConnectionInfo.from_dict(c) for c in mcp_connections_data]
+                        provider = McpToolProvider(connections, mcp_session_manager, logger)
+                        mcp_tools = await provider.discover_all_tools()
+                        if mcp_tools:
+                            # Additive: MCP tools sit alongside fetch_full_record.
+                            # The model picks which to call based on the query.
+                            tools = [fetch_tool, *mcp_tools]
+                            logger.info(
+                                f"Discovered {len(mcp_tools)} MCP tools from {len(connections)} server(s) — "
+                                f"toolset is now fetch_full_record + {len(mcp_tools)} MCP tools"
+                            )
+                except Exception as e:
+                    logger.warning(f"MCP tool discovery failed (soft-fail): {e}")
+                    mcp_tools = []
+
+                # Build the current user message with retrieved context. has_mcp_tools
+                # flips Section 7 and the tool-answer example in the Jinja template.
+                has_mcp_tools = bool(mcp_tools)
+                content = get_message_content(
+                    final_results,
+                    virtual_record_id_to_result,
+                    user_data,
+                    query_info.query,
+                    logger,
+                    query_info.mode,
+                    has_mcp_tools=has_mcp_tools,
+                )
+                messages.append({"role": "user", "content": content})
 
                 tool_runtime_kwargs = {
                     "blob_store": blob_store,
@@ -700,6 +798,9 @@ async def askAIStream(
                     tool_runtime_kwargs=tool_runtime_kwargs,
                     target_words_per_chunk=1,
                     mode=query_info.mode,
+                    # Multi-step flows (MCP search → act → answer) need a larger
+                    # budget; pure RAG only ever needs one hop of fetch_full_record.
+                    max_hops=6 if mcp_tools else 1,
                 ):
                     event_type = stream_event["event"]
                     event_data = stream_event["data"]
@@ -711,6 +812,13 @@ async def askAIStream(
         except Exception as e:
             logger.error(f"Error in streaming AI: {str(e)}", exc_info=True)
             yield create_sse_event("error", {"error": str(e)})
+        finally:
+            # Clean up MCP sessions
+            if mcp_session_manager is not None:
+                try:
+                    await mcp_session_manager.close_all()
+                except Exception as cleanup_err:
+                    logger.warning(f"Error closing MCP sessions: {cleanup_err}")
 
     return StreamingResponse(
         generate_stream(),

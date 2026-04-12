@@ -156,7 +156,12 @@ export interface AIServiceResponse<T> {
   msg?: string;
 }
 
-export type AnswerMatchType = 'Exact Match' | 'Partial Match' | 'No Match';
+export type AnswerMatchType =
+  | 'Exact Match'
+  | 'Derived From Blocks'
+  | 'Derived From User Info'
+  | 'Enhanced With Full Record'
+  | 'Derived From Tool Execution';
 
 export interface IAIResponse {
   answer: string;

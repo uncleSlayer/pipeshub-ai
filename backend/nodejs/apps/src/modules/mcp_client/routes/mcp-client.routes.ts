@@ -9,7 +9,6 @@ import { McpClientService } from '../services/mcp-client.service';
 import {
   startMcpAuth,
   handleMcpAuthCallback,
-  getMcpToken,
   deleteMcpToken,
   listMcpConnections,
   connectMcpBearer,
@@ -91,15 +90,6 @@ export function createMcpClientRouter(container: Container): Router {
     metricsMiddleware(container),
     ValidationMiddleware.validate(callbackSchema),
     handleMcpAuthCallback(service),
-  );
-
-  // GET /auth/token — Authenticated
-  router.get(
-    '/auth/token',
-    authMiddleware.authenticate,
-    metricsMiddleware(container),
-    ValidationMiddleware.validate(mcpServerUrlQuerySchema),
-    getMcpToken(service),
   );
 
   // DELETE /auth/token — Authenticated

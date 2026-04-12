@@ -8,7 +8,6 @@ import {
   NotFoundError,
   BadGatewayError,
   UnprocessableEntityError,
-  InternalServerError,
 } from '../../../libs/errors/http.errors';
 import {
   ProtectedResourceMetadata,
@@ -18,7 +17,6 @@ import {
   StoredTokenData,
   StartAuthRequest,
   StartAuthResponse,
-  TokenResponse,
   McpConnectionInfo,
   ClientMetadataDocument,
   ClientRegistrationMethod,
@@ -29,7 +27,6 @@ import {
 } from '../types/mcp-client.types';
 
 const FLOW_STATE_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const TOKEN_REFRESH_BUFFER_MS = 60 * 1000; // 60 seconds before expiry
 const HTTP_TIMEOUT_MS = 10_000;
 
 export class McpClientService {
@@ -178,17 +175,20 @@ export class McpClientService {
       throw new BadGatewayError('Token endpoint did not return access_token');
     }
 
-    // Encrypt sensitive fields individually
+    // The whole record is encrypted as a single blob (matching the format the
+    // Python encrypted store expects: iv:ciphertext:authTag of the JSON string).
+    // Do NOT encrypt individual fields — that produces a dict-shaped value
+    // which the Python side cannot decrypt as a wrapper.
     const storedToken: StoredTokenData = {
       authType: McpAuthType.OAUTH,
-      accessToken: this.encryptionService.encrypt(access_token),
-      refreshToken: refresh_token ? this.encryptionService.encrypt(refresh_token) : undefined,
+      accessToken: access_token,
+      refreshToken: refresh_token,
       tokenType: token_type || 'Bearer',
       scope: scope || flowState.scope,
       expiresAt: expires_in ? Date.now() + expires_in * 1000 : undefined,
       mcpServerUrl,
       clientId: flowState.clientId,
-      clientSecret: flowState.clientSecret ? this.encryptionService.encrypt(flowState.clientSecret) : undefined,
+      clientSecret: flowState.clientSecret,
       tokenEndpoint: flowState.tokenEndpoint,
       resource: flowState.resource,
       registrationMethod: flowState.registrationMethod,
@@ -199,7 +199,7 @@ export class McpClientService {
     const serverUrlHash = this.hashUrl(mcpServerUrl);
     await this.kvStore.set(
       `/orgs/${orgId}/users/${userId}/mcp/${serverUrlHash}/token`,
-      JSON.stringify(storedToken),
+      this.encryptionService.encrypt(JSON.stringify(storedToken)),
     );
 
     // Clean up flow state
@@ -208,68 +208,6 @@ export class McpClientService {
     this.logger.info('OAuth token exchange successful', { mcpServerUrl, orgId, userId });
 
     return { success: true, mcpServerUrl };
-  }
-
-  async getToken(
-    orgId: string,
-    userId: string,
-    mcpServerUrl: string,
-  ): Promise<TokenResponse> {
-    const serverUrlHash = this.hashUrl(mcpServerUrl);
-    const key = `/orgs/${orgId}/users/${userId}/mcp/${serverUrlHash}/token`;
-    const stored = await this.kvStore.get<string>(key);
-
-    if (!stored) {
-      throw new NotFoundError('No stored token for this MCP server');
-    }
-
-    let storedToken: StoredTokenData;
-    try {
-      storedToken = JSON.parse(stored);
-    } catch {
-      throw new InternalServerError('Failed to parse stored token data');
-    }
-
-    const authType = storedToken.authType || McpAuthType.OAUTH;
-
-    // Bearer tokens don't expire or need refresh
-    if (authType === McpAuthType.OAUTH) {
-      // Check if token needs refresh
-      if (storedToken.expiresAt && storedToken.expiresAt - Date.now() < TOKEN_REFRESH_BUFFER_MS) {
-        if (storedToken.refreshToken) {
-          try {
-            storedToken = await this.refreshAccessToken(orgId, userId, storedToken);
-          } catch (error: any) {
-            this.logger.warn('Token refresh failed, removing stale token', {
-              error: error.message,
-              mcpServerUrl,
-            });
-            await this.kvStore.delete(key);
-            throw new NotFoundError('Token expired and refresh failed');
-          }
-        } else {
-          // No refresh token, remove stale token
-          await this.kvStore.delete(key);
-          throw new NotFoundError('Token expired and no refresh token available');
-        }
-      }
-    }
-
-    let accessToken: string;
-    try {
-      accessToken = this.encryptionService.decrypt(storedToken.accessToken);
-    } catch {
-      throw new InternalServerError('Failed to decrypt access token');
-    }
-
-    return {
-      accessToken,
-      tokenType: storedToken.tokenType,
-      expiresAt: storedToken.expiresAt,
-      scope: storedToken.scope,
-      mcpServerUrl: storedToken.mcpServerUrl,
-      authType,
-    };
   }
 
   async deleteToken(orgId: string, userId: string, mcpServerUrl: string): Promise<void> {
@@ -289,7 +227,9 @@ export class McpClientService {
       try {
         const stored = await this.kvStore.get<string>(key);
         if (!stored) continue;
-        const storedToken: StoredTokenData = JSON.parse(stored);
+        const storedToken: StoredTokenData = JSON.parse(
+          this.encryptionService.decrypt(stored),
+        );
         connections.push({
           mcpServerUrl: storedToken.mcpServerUrl,
           authType: storedToken.authType || McpAuthType.OAUTH,
@@ -330,7 +270,7 @@ export class McpClientService {
 
     const storedToken: StoredTokenData = {
       authType: McpAuthType.BEARER_TOKEN,
-      accessToken: this.encryptionService.encrypt(bearerToken),
+      accessToken: bearerToken,
       tokenType: 'Bearer',
       mcpServerUrl,
       registrationMethod: ClientRegistrationMethod.BEARER_TOKEN,
@@ -341,7 +281,7 @@ export class McpClientService {
     const serverUrlHash = this.hashUrl(mcpServerUrl);
     await this.kvStore.set(
       `/orgs/${orgId}/users/${userId}/mcp/${serverUrlHash}/token`,
-      JSON.stringify(storedToken),
+      this.encryptionService.encrypt(JSON.stringify(storedToken)),
     );
 
     this.logger.info('Bearer token connection stored', { mcpServerUrl, orgId, userId });
@@ -568,77 +508,6 @@ export class McpClientService {
       .update(codeVerifier)
       .digest('base64url');
     return { codeVerifier, codeChallenge };
-  }
-
-  // ============================================================================
-  // Private Helpers — Token Refresh
-  // ============================================================================
-
-  private async refreshAccessToken(
-    orgId: string,
-    userId: string,
-    storedToken: StoredTokenData,
-  ): Promise<StoredTokenData> {
-    if ((storedToken.authType || McpAuthType.OAUTH) === McpAuthType.BEARER_TOKEN) {
-      throw new Error('Bearer token connections do not support refresh');
-    }
-
-    if (!storedToken.refreshToken) {
-      throw new Error('No refresh token available');
-    }
-
-    if (!storedToken.clientId || !storedToken.tokenEndpoint || !storedToken.resource) {
-      throw new Error('Missing OAuth fields required for token refresh');
-    }
-
-    const refreshToken = this.encryptionService.decrypt(storedToken.refreshToken);
-    const clientSecret = storedToken.clientSecret
-      ? this.encryptionService.decrypt(storedToken.clientSecret)
-      : undefined;
-
-    const params = new URLSearchParams();
-    params.set('grant_type', 'refresh_token');
-    params.set('refresh_token', refreshToken);
-    params.set('client_id', storedToken.clientId);
-    if (clientSecret) {
-      params.set('client_secret', clientSecret);
-    }
-    params.set('resource', storedToken.resource);
-
-    const response = await this.httpPost(storedToken.tokenEndpoint, params.toString(), {
-      'Content-Type': 'application/x-www-form-urlencoded',
-    });
-
-    const { access_token, refresh_token: newRefreshToken, expires_in, scope } = response;
-
-    if (!access_token) {
-      throw new Error('Refresh token response did not return access_token');
-    }
-
-    const updatedToken: StoredTokenData = {
-      ...storedToken,
-      accessToken: this.encryptionService.encrypt(access_token),
-      refreshToken: newRefreshToken
-        ? this.encryptionService.encrypt(newRefreshToken)
-        : storedToken.refreshToken,
-      expiresAt: expires_in ? Date.now() + expires_in * 1000 : storedToken.expiresAt,
-      scope: scope || storedToken.scope,
-      updatedAt: Date.now(),
-    };
-
-    const serverUrlHash = this.hashUrl(storedToken.mcpServerUrl);
-    await this.kvStore.set(
-      `/orgs/${orgId}/users/${userId}/mcp/${serverUrlHash}/token`,
-      JSON.stringify(updatedToken),
-    );
-
-    this.logger.info('Token refreshed successfully', {
-      mcpServerUrl: storedToken.mcpServerUrl,
-      orgId,
-      userId,
-    });
-
-    return updatedToken;
   }
 
   // ============================================================================

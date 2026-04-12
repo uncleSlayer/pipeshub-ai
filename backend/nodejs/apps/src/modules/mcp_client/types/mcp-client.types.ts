@@ -90,15 +90,6 @@ export interface ConnectBearerRequest {
   bearerToken: string;
 }
 
-export interface TokenResponse {
-  accessToken: string;
-  tokenType: string;
-  expiresAt?: number;
-  scope?: string;
-  mcpServerUrl: string;
-  authType: McpAuthType;
-}
-
 export interface McpConnectionInfo {
   mcpServerUrl: string;
   authType: McpAuthType;

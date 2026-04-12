@@ -38,24 +38,6 @@ export const handleMcpAuthCallback =
     }
   };
 
-export const getMcpToken =
-  (service: McpClientService) =>
-  async (req: AuthenticatedUserRequest, res: Response, next: NextFunction): Promise<void> => {
-    try {
-      const { userId, orgId } = req.user || {};
-      if (!userId || !orgId) {
-        throw new UnauthorizedError('User authentication required');
-      }
-
-      const mcpServerUrl = req.query.mcpServerUrl as string;
-      const result = await service.getToken(orgId, userId, mcpServerUrl);
-      res.status(200).json(result);
-    } catch (error: any) {
-      logger.error('Error getting MCP token', { error: error.message });
-      next(error);
-    }
-  };
-
 export const deleteMcpToken =
   (service: McpClientService) =>
   async (req: AuthenticatedUserRequest, res: Response, next: NextFunction): Promise<void> => {
