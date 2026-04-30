@@ -5,6 +5,7 @@ import { Button, Flex, Text } from '@radix-ui/themes';
 import { MaterialIcon } from '@/app/components/ui/MaterialIcon';
 import { ConnectorsApi } from '../../api';
 import { useToastStore } from '@/lib/store/toast-store';
+import { useConnectorsStore } from '../../store';
 
 /** Brief busy state after instance-card async actions so rapid double-clicks do not stack requests. */
 const INSTANCE_ACTION_BUTTON_BUSY_MS = 800;
@@ -136,6 +137,7 @@ export function SyncButton({
 }) {
   const [state, setState] = useState<SyncState>('idle');
   const addToast = useToastStore((s) => s.addToast);
+  const bumpCatalogRefresh = useConnectorsStore((s) => s.bumpCatalogRefresh);
 
   const handleClick = async () => {
     if (state === 'syncing') return;
@@ -143,6 +145,7 @@ export function SyncButton({
     addToast({ variant: 'success', title: 'Sync started' });
     try {
       await ConnectorsApi.resyncConnector(connectorId, connectorType);
+      bumpCatalogRefresh();
       await new Promise((resolve) => setTimeout(resolve, 2000));
       setState('idle');
     } catch {
@@ -195,6 +198,7 @@ export function FullSyncButton({
 }) {
   const [state, setState] = useState<SyncState>('idle');
   const addToast = useToastStore((s) => s.addToast);
+  const bumpCatalogRefresh = useConnectorsStore((s) => s.bumpCatalogRefresh);
 
   const handleClick = async () => {
     if (state === 'syncing') return;
@@ -202,6 +206,7 @@ export function FullSyncButton({
     addToast({ variant: 'success', title: 'Full sync started' });
     try {
       await ConnectorsApi.resyncConnector(connectorId, connectorType, true);
+      bumpCatalogRefresh();
       await new Promise((resolve) => setTimeout(resolve, 2000));
       setState('idle');
     } catch {
@@ -256,6 +261,7 @@ export function ReindexFailedButton({
 }) {
   const [busy, setBusy] = useState(false);
   const addToast = useToastStore((s) => s.addToast);
+  const bumpCatalogRefresh = useConnectorsStore((s) => s.bumpCatalogRefresh);
 
   if (failedCount <= 0) return null;
 
@@ -265,6 +271,7 @@ export function ReindexFailedButton({
     try {
       await ConnectorsApi.reindexFailedConnector(connectorId, connectorType);
       addToast({ variant: 'success', title: 'Reindexing failed records…' });
+      bumpCatalogRefresh();
     } catch {
       addToast({ variant: 'error', title: 'Failed to reindex failed records' });
     } finally {
@@ -299,6 +306,7 @@ export function ManualIndexButton({
 }) {
   const [busy, setBusy] = useState(false);
   const addToast = useToastStore((s) => s.addToast);
+  const bumpCatalogRefresh = useConnectorsStore((s) => s.bumpCatalogRefresh);
 
   if (autoIndexOffCount <= 0) return null;
 
@@ -308,6 +316,7 @@ export function ManualIndexButton({
     try {
       await ConnectorsApi.reindexFailedConnector(connectorId, connectorType, ['AUTO_INDEX_OFF']);
       addToast({ variant: 'success', title: 'Indexing manual-sync records…' });
+      bumpCatalogRefresh();
     } catch {
       addToast({ variant: 'error', title: 'Failed to start manual index' });
     } finally {
