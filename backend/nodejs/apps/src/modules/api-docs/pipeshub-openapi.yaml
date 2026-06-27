@@ -4198,8 +4198,16 @@ components:
             - done
             - error
         data:
-          type: string
-          description: JSON-encoded event payload. Shape depends on `event`.
+          type: object
+          additionalProperties: true
+          description: |
+            Decoded event payload. Shape depends on `event`:
+            `file:succeeded` → `UploadSucceededFileDetail`,
+            `file:failed` → `UploadFailedFileDetail`,
+            `done` → `UploadDoneSummary`,
+            `error` → `{ "message": string }`.
+            On the wire this is a JSON-encoded string in the SSE `data:` line;
+            SDKs decode it to this object.
 
     IndexingStatusFilter:
       type: string
