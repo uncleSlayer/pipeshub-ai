@@ -1,0 +1,96 @@
+# Rules that define the public projection of the enterprise tree.
+#
+# The OSS repository is a *derived artifact*: its content is
+# `tree(enterprise commit) minus everything matched below`. Nothing is ever
+# merged in the OSS direction, so a change here changes what the world sees on
+# the next sync. Treat this file as security-sensitive.
+
+[source]
+# Enterprise repo (source of truth). Branch that developers actually merge into.
+branch = "master"
+# Mirror one commit per merge into `branch` rather than replaying every commit
+# that was ever authored on a side branch.
+first_parent = true
+
+[target]
+# Public repo. The sync only ever fast-forwards this branch.
+#
+# There is no sync state beyond this branch: every published commit carries an
+# `EE-Source:` trailer, so the newest one that has it *is* the bookmark. Nothing
+# to persist on a runner, nothing to corrupt, and any clone can resume.
+branch = "main"
+
+[exclude]
+# Glob patterns matched against repo-relative paths. A pattern that matches a
+# directory excludes everything beneath it. `**` spans directory separators,
+# `*` and `?` do not.
+paths = [
+  "ee",
+  "**/ee",
+  "*.ee.local.*",
+  ".github/workflows/ee-*.yml",
+  ".github/workflows/ee-*.yaml",
+  "deployment/**/ee-values*.yaml",
+  "**/*.enterprise.env",
+]
+
+[surface]
+# Top-level entries permitted in the published tree. Anything the enterprise
+# repo grows that is not listed here halts the sync instead of being published
+# by accident. This is the difference between failing closed and failing open:
+# a new proprietary directory named something other than `ee/` must not ship
+# just because nobody remembered to add an exclude rule.
+top_level = [
+  ".claude",
+  ".dockerignore",
+  ".gemini",
+  ".github",
+  ".gitignore",
+  ".spectral.yaml",
+  "CLAUDE.md",
+  "CODE_OF_CONDUCT.md",
+  "CONNECTOR_INTEGRATION_PLAYBOOK.md",
+  "CONTRIBUTING.md",
+  "Dockerfile",
+  "Dockerfile.base",
+  "LICENSE",
+  "README.md",
+  "SECURITY.md",
+  "backend",
+  "cspell.json",
+  "deployment",
+  "docs",
+  "frontend",
+  "integration-tests",
+  "integrations",
+  "loadtest",
+  "logs",
+  "package-lock.json",
+  "scripts",
+  "tools",
+]
+
+[guards]
+# No published path may contain a segment with these names, whatever the
+# exclude rules say.
+forbidden_path_segments = ["ee", "enterprise"]
+
+# Content patterns (POSIX extended regex, fed to `git grep -E`) that must not
+# appear in any published file. These catch the leak the path rules cannot: a
+# *shared* file that reaches into enterprise code. After `ee/` is stripped such
+# a reference is both a disclosure and a broken build.
+[[guards.forbidden_content]]
+name = "python-ee-import"
+pattern = "^[[:space:]]*(from|import)[[:space:]]+(app\\.)?ee[\\.[:space:]]"
+
+[[guards.forbidden_content]]
+name = "ts-ee-import"
+pattern = "(from|import|require)[[:space:]]*\\(?[[:space:]]*['\"][^'\"]*(^|/)ee/"
+
+[[guards.forbidden_content]]
+name = "ts-ee-alias"
+pattern = "['\"]@/ee/|['\"]@ee/"
+
+[[guards.forbidden_content]]
+name = "commercial-license-header"
+pattern = "Enterprise Edition License|Commercial License|PipesHub Enterprise License"
